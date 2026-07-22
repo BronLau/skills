@@ -1,0 +1,4 @@
+interface:
+  display_name: "创量需求文档"
+  short_description: "根据当前会话中的原型与决策编写并更新飞书产品需求文档"
+  default_prompt: "使用 $cl-write-prd 根据当前会话中已经确认的原型和需求，为我提供的飞书文档编写需求文档。"
