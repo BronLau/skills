@@ -29,6 +29,25 @@
 使用 $cl-write-prd，根据当前会话中已经确认的原型和需求，为这个飞书文档编写需求文档：<飞书文档链接>
 ```
 
+### v2role-card
+
+从上传的视频中识别主要人物、抽取关键帧，并为用户确认后的每个角色生成一张 4:3 写实六视图角色卡。
+
+核心流程：
+
+1. 解析视频并生成带时间点的候选帧与联系表；
+2. 提议主要角色数量，整理每个角色的外貌、发型、服装、体态和身份识别锚点；
+3. 等待用户确认角色数量和逐角色文本描述；
+4. 分角色整理身份与服装参考图；
+5. 生成上排脸部三角度、下排全身三视图的白棚写实角色卡；
+6. 校验身份、服装、角度、构图和 4:3 比例后交付。
+
+调用示例：
+
+```text
+使用 $v2role-card 分析我上传的视频，确认角色数量与逐角色描述后生成六视图角色卡。
+```
+
 ## 本地安装
 
 将 Skill 目录复制或软链接到 Codex Skills 目录：
@@ -36,6 +55,7 @@
 ```bash
 mkdir -p ~/.codex/skills
 ln -s /absolute/path/to/skills/cl-write-prd ~/.codex/skills/cl-write-prd
+ln -s /absolute/path/to/skills/v2role-card ~/.codex/skills/v2role-card
 ```
 
-安装后可在新的 Codex 对话轮次中使用 `$cl-write-prd` 触发。
+安装后可在新的 Codex 对话轮次中使用对应的 `$skill-name` 触发。

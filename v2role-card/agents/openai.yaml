@@ -1,0 +1,4 @@
+interface:
+  display_name: "视频角色卡制作"
+  short_description: "从视频识别主要角色，经确认后生成六视图写实人物角色卡"
+  default_prompt: "使用 $v2role-card 分析我上传的视频，确认角色数量与逐角色描述后生成六视图角色卡。"
