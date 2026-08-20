@@ -1,12 +1,12 @@
-# video-reverse-replicate-chuangliang · 视频逆向复刻（创量版）
+# video-reverse-replicate-product · 视频逆向复刻（产品替换版）
 
-输入一段成片视频，输出一套「可复刻的生产素材包」：分镜大纲、角色/场景参考图、可直接投喂视频生成模型的段级提示词，以及（可选的）复刻成片。面向创量客户的真人素材复刻场景定制。
+输入一段成片视频和可选的 1-3 张同一目标产品图片，输出一套「可复刻的生产素材包」：分镜大纲、角色/场景/产品参考图、可直接投喂视频生成模型的段级提示词，以及（可选的）复刻成片。提供产品图时，复刻结果保留原片剧情与产品调度，但把原片产品替换为用户产品；不提供时保持原流程。
 
-## 与底座版的三点差异
+## 与底座版的四点差异
 
 **① 角色参考图 = 原片抽帧 + 角色卡 Prompt 的图生图（I2I）**
 
-底座版用文生图"重画"角色——再准也是"长得像但不是"。创量复刻对人物还原度要求极高，因此本版本改为：按角色卡"出现镜头"从原片抽 3 张候选帧 → 用户挑 1 张定稿 → 把定稿帧和角色卡 Prompt 一起喂给 qwen-image-3.0-pro 做图生图。**帧锁身份**（面部/发型/服装严格照原片真人），**卡 Prompt 锁构图/姿态/背景**（脚本自动在卡 Prompt 前拼接身份锁定指令，并关闭 prompt_extend 防改写）。场景卡仍走文生图。
+底座版用文生图"重画"角色——再准也是"长得像但不是"。真人素材复刻对人物还原度要求极高，因此本版本改为：按角色卡"出现镜头"从原片抽 3 张候选帧 → 用户挑 1 张定稿 → 把定稿帧和角色卡 Prompt 一起喂给 qwen-image-3.0-pro 做图生图。**帧锁身份**（面部/发型/服装严格照原片真人），**卡 Prompt 锁构图/姿态/背景**（脚本自动在卡 Prompt 前拼接身份锁定指令，并关闭 prompt_extend 防改写）。场景卡仍走文生图。
 
 **② 成片全程无字幕**
 
@@ -14,7 +14,11 @@
 
 **③ 生成段上限放宽到 30 秒**
 
-创量链路的视频模型支持单次直接生成 30 秒，生成段时长上限由底座的 ≤15s 放宽到 ≤30s：剧情连贯的连续镜头尽量打包满（接近 30s），段越少跨段衔接点越少、拼接越稳；但不为凑时长把场景/时空跨度大的镜头硬塞进同一段。第二步规划/复核与第三步时间轴规则均已按 30s 调整。
+当前链路的视频模型支持单次直接生成 30 秒，生成段时长上限由底座的 ≤15s 放宽到 ≤30s：剧情连贯的连续镜头尽量打包满（接近 30s），段越少跨段衔接点越少、拼接越稳；但不为凑时长把场景/时空跨度大的镜头硬塞进同一段。第二步规划/复核与第三步时间轴规则均已按 30s 调整。
+
+**④ 可选产品替换 = 原片调度 + 用户产品身份**
+
+用户可提供 1-3 张同一产品的正面、侧面或细节图。原片只控制产品的数量、位置、尺度、朝向、持握/摆放/使用动作、遮挡和光影；用户图片控制产品造型、包装、颜色、材质、品牌标识与产品本体文字。产品原图直接进入参考图索引，不经过二次重绘；多图共同定义同一个产品，不会被理解成多个产品实例。
 
 其余流程与底座 `video-reverse-replicate` 完全一致：三步分工（选角置景 → 运镜调度 → 提示词撰写）、omni+max 两阶段精修、音频事实保护、参考图候选挑选检查点；生成段方案沿用底座逻辑，仅段时长上限不同。
 
@@ -26,26 +30,27 @@
 - `pip install openai dashscope pillow -i https://mirrors.aliyun.com/pypi/simple/`
 - ffmpeg（视频压缩、抽帧、候选图拼接、成片拼接）
 - 本地视频 base64 编码后需 < 10MB（约 7MB 原文件），超限先用 ffmpeg 压缩（抽帧仍用原片高清版）
+- 产品图片选填；提供时选择同一产品的 1-3 张清晰互补视角。若是多个不同产品，需先确认逐一映射，当前单次流程处理一个目标产品。
 
-对 Agent 说一句"用创量版复刻这个视频"并附上视频文件，即可按下述流程走完全程。
+对 Agent 说一句"用产品替换版复刻这个视频，并把原片产品换成这些产品图里的产品"，附上视频与产品图即可。只附视频时按原流程复刻，不替换产品。
 
 ## 工作流程
 
 ```
-原片视频
+原片视频 + 可选产品图（1-3张，同一产品）
   │
-  ├─ ① step1 选角与置景（qwen3.8-max 看片）
-  │     → 分镜大纲.md：逐镜头大纲 + 角色卡 + 场景卡（文生图 Prompt）
+  ├─ ① step1 选角、置景与产品映射（qwen3.8-max 看片+产品图）
+  │     → 分镜大纲.md：逐镜头大纲 + 角色卡 + 场景卡；产品模式追加产品卡
   │
   ├─ ② 角色抽帧（extract_char_frames.py，每角色 3 张候选帧）
   │     → refs/frames/：帧_<角色>_1..3.jpg + frames.json
   │     → 用户每角色挑 1 张定稿 → frames/selected.json
   │
-  ├─ ③ 参考图生成（generate_ref_images.py --frames-index）
-  │     角色卡：定稿帧 I2I；场景卡：文生图。每卡 3 张候选
+  ├─ ③ 参考图准备（generate_ref_images.py）
+  │     角色卡：定稿帧 I2I；场景卡：文生图；产品卡：直接登记用户产品原图
   │     → refs/：候选图 + index.json（人工每卡挑 1 张定稿）
   │
-  ├─ ★ 检查点：人工确认卡片与参考图（角色图重点比对定稿帧长相）后才继续
+  ├─ ★ 检查点：人工确认角色/场景/产品卡与参考图；核对产品替换镜头无遗漏
   │
   ├─ ④ step2 运镜与调度（两阶段，无字幕，生成段≤30s）
   │     A. qwen3.5-omni 听音+看片 → 详细分镜初稿.md
@@ -61,7 +66,8 @@
 
 ```bash
 # ① 第一步分析
-python3 scripts/analyze_video.py step1 --video 原片.mp4 --output 分镜大纲.md
+python3 scripts/analyze_video.py step1 --video 原片.mp4 \
+  --product-images 产品正面.jpg 产品侧面.jpg --output 分镜大纲.md
 
 # ② 角色抽帧（按角色卡"出现镜头"抽候选帧）
 python3 scripts/extract_char_frames.py --cards 分镜大纲.md --video 原片.mp4 --output refs/frames
@@ -69,11 +75,14 @@ python3 scripts/extract_char_frames.py --cards 分镜大纲.md --video 原片.mp
 # 值也可写 ≤3 帧路径列表（多帧同时作 I2I 参考，服装细节难还原时用）
 
 # ③ 参考图（角色卡走定稿帧 I2I、场景卡文生图；每卡 3 候选；--only 可单独重出某张卡）
-python3 scripts/generate_ref_images.py --cards 分镜大纲.md --output refs --frames-index refs/frames/selected.json
+python3 scripts/generate_ref_images.py --cards 分镜大纲.md --output refs \
+  --frames-index refs/frames/selected.json --product-images 产品正面.jpg 产品侧面.jpg
 
 # ④ 第二步两阶段
-python3 scripts/analyze_video.py step2  --video 原片.mp4 --step1-file 分镜大纲.md --output 详细分镜初稿.md
-python3 scripts/analyze_video.py refine --video 原片.mp4 --step1-file 分镜大纲.md --draft-file 详细分镜初稿.md --output 详细分镜.md
+python3 scripts/analyze_video.py step2  --video 原片.mp4 --step1-file 分镜大纲.md \
+  --product-images 产品正面.jpg 产品侧面.jpg --output 详细分镜初稿.md
+python3 scripts/analyze_video.py refine --video 原片.mp4 --step1-file 分镜大纲.md \
+  --draft-file 详细分镜初稿.md --product-images 产品正面.jpg 产品侧面.jpg --output 详细分镜.md
 
 # ⑤ 第三步提示词
 python3 scripts/analyze_video.py step3 --step2-file 详细分镜.md --step1-file 分镜大纲.md --refs-index refs/index.json --output 生视频提示词.md
@@ -83,20 +92,27 @@ python3 scripts/generate_video.py --prompt "<该段★Prompt>" --refs refs/图1.
   --duration <段总时长向上取整，≤30> --resolution 1080P --ratio 9:16 --output shots/seg1.mp4
 ```
 
+不替换产品时，以上命令全部省略 `--product-images`，行为与 1.0 版一致。产品图在 step1/step2/refine 中用于视觉理解，在 `generate_ref_images.py` 中被复制到 `refs/products/` 并登记进 `refs/index.json`；step3 通过该索引把同一产品的多张参考图展开为连续图号。
+
 两个硬检查点：参考图定稿前**必须人工确认**（卡名会被后续所有环节严格引用，错误会一路传导；角色参考图必须与定稿帧并排比对长相）；生视频**默认不执行**（慢且耗额度，需明确要求）。
 
 ## 产物清单
 
 | 文件 | 内容 |
 | --- | --- |
-| `分镜大纲.md` | 逐镜头大纲 + 角色卡 + 场景卡（文生图 Prompt） |
+| `分镜大纲.md` | 逐镜头大纲 + 角色卡 + 场景卡；产品模式追加产品卡、替换镜头与状态映射 |
 | `refs/frames/` | 每角色 3 张候选抽帧 + frames.json + selected.json（定稿帧映射） |
-| `refs/` + `index.json` | 每卡 3 张候选参考图与定稿映射（数组第一张为定稿） |
+| `refs/` + `index.json` | 角色/场景候选与定稿映射；产品卡保存 1-3 张用户产品原图 |
+| `refs/products/` | 产品模式下的用户产品原图副本，直接作为产品身份参考 |
 | `详细分镜.md` | 生成段规划表 + 分幕镜头细节块（布景站位/光影/逐秒时间轴/切镜标注，无字幕） |
 | `生视频提示词.md` | 每生成段：参考图清单（段首，作为编号承诺）+ ★视频生成 Prompt（首行声明无字幕）+ 首帧合成指引 |
 | `shots/`（可选） | 各生成段视频与拼接成片 |
 
 ## 设计思路
+
+### 为什么产品替换必须成为独立参考链路
+
+原片同时包含“产品如何被拍摄”和“原产品长什么样”两类事实。若只在最终 Prompt 里写“换成用户产品”，原产品仍可能从角色抽帧、场景参考图或详细分镜回流。当前版本把两类事实拆开：原片仅提供位置、尺度、朝向、动作、接触、遮挡与光影；用户产品原图单独进入产品卡和 `index.json`，负责造型、包装、品牌与本体文字。角色图和场景图不保留旧产品，从源头避免身份冲突。
 
 ### 为什么角色参考图要抽帧 I2I，而不是纯文生图
 
@@ -117,6 +133,9 @@ python3 scripts/generate_video.py --prompt "<该段★Prompt>" --refs refs/图1.
 - **wan 系生图不接参考图**：抽帧 I2I 必须用 qwen-image 系（默认 qwen-image-3.0-pro）；`--model` 切 wan 系时脚本会警告并忽略帧输入。
 - **I2I 须关 prompt_extend**：否则模型改写提示词导致色值/构图漂移——脚本已内置。
 - **多段拼接必须显式 `--ratio`**（与原片一致，竖屏 9:16）：默认 adaptive 可能出方形段，导致 ffmpeg concat 分辨率不匹配。
+- **产品图不重绘**：直接登记用户原图；多图是同一个产品的多视角证据。产品出现的段全部带上产品图号，并明确参考图背景不进入场景。
+- **角色抽帧避开旧产品**：优先选不含原产品的清晰人脸帧；无法避开时，角色参考图生成会要求移除旧产品。场景参考图也只保留承载空间，不生成新旧产品。
+- **包装文字与字幕分开处理**：画面不叠加字幕，但产品包装本体上的品牌标识和文字属于产品身份，需按产品参考图保留。
 - **wan3.0-video 账号并发约 2 任务**：批量提交错开数秒即可，超额任务服务端排队不会失败；task_id 与视频 URL 有效期 24h，中断可凭 task_id 恢复下载。
 - **所有脚本不覆盖已有文件**：同名自动加 `_1/_2` 后缀，重跑安心，但取用时注意拿最新文件。
 - **无字幕/无水印是硬规则**：任何产物混入字幕或水印描述，按源头治理修 system prompt 后重跑，不手动逐处修补。
@@ -124,19 +143,19 @@ python3 scripts/generate_video.py --prompt "<该段★Prompt>" --refs refs/图1.
 ## 目录结构
 
 ```
-video-reverse-replicate-chuangliang/
+video-reverse-replicate-product/
 ├── SKILL.md                        # Agent 执行手册（完整流程与核对清单）
 ├── README.md                       # 本文档
 ├── prompts/
-│   ├── step1_system.md             # 第一步：选角与置景
+│   ├── step1_system.md             # 第一步：选角、置景与可选产品映射
 │   ├── step2_system.md             # 第二步A：omni 听音初稿（无字幕）
 │   ├── step2_refine_system.md      # 第二步B：max 看片精修（音频事实保护+剔除字幕）
 │   ├── step3_system.md             # 第三步：提示词无损翻译（五要素、首行声明无字幕）
 │   └── card_maker_system.md        # 备用：卡片文本单独精修
 └── scripts/
     ├── analyze_video.py            # step1 / step2 / refine / step3 四合一 CLI
-    ├── extract_char_frames.py      # 创量定制：按角色卡出现镜头抽候选帧
-    ├── generate_ref_images.py      # 参考图生成：--frames-index 角色卡抽帧 I2I
+    ├── extract_char_frames.py      # 按角色卡出现镜头抽候选帧
+    ├── generate_ref_images.py      # 角色/场景参考图生成 + 用户产品原图登记
     ├── generate_video.py           # R2V 视频生成（默认 wan3.0-video，异步+断点恢复）
     └── make_cards.py               # 备用：旧版大纲卡片精修
 ```
@@ -145,9 +164,9 @@ video-reverse-replicate-chuangliang/
 
 | 环节 | 模型 | 备注 |
 | --- | --- | --- |
-| step1 选角置景 | qwen3.8-max | 看片直出，`--model` 可覆盖 |
+| step1 选角置景/产品映射 | qwen3.8-max | 看片+可选产品图，`--model` 可覆盖 |
 | step2 初稿 | qwen3.5-omni-plus | 唯一音频理解，听音+看片 |
 | refine 精修 | qwen3.8-max | 看片校对，音频以初稿为准 |
 | step3 提示词 | qwen3.8-max | 纯文本，不吃视频 |
 | 参考图 | qwen-image-3.0-pro | 角色卡抽帧 I2I + 场景卡文生图，每卡 3 候选 |
-| 生视频 | wan3.0-video | R2V，≤30s/段（创量链路上限），1080P；`--model` 可换 |
+| 生视频 | wan3.0-video | R2V，≤30s/段（当前链路上限），1080P；`--model` 可换 |

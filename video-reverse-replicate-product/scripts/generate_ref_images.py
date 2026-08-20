@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-视频逆向复刻（创量版）- 参考图生成（默认 qwen-image-3.0-pro，角色卡走抽帧 I2I）
+视频逆向复刻（产品替换版）- 参考图生成（默认 qwen-image-3.0-pro，角色卡走抽帧 I2I）
 
-自动解析第一步产出（分镜大纲.md）里的【角色卡 - XXX】/【场景卡 - XXX】，
-逐卡调用生图生成参考图，并输出 index.json（卡名 → 图片路径映射）。
+自动解析第一步产出（分镜大纲.md）里的【角色卡 - XXX】/【场景卡 - XXX】/【产品卡 - XXX】，
+角色卡与场景卡调用生图，产品卡直接登记用户提供的产品原图，并输出 index.json（卡名 → 图片路径映射）。
 角色卡默认配合 extract_char_frames.py 抽出的原片帧做 I2I（面部/发型/服装细节以帧为准，
 文字与帧冲突时一律以帧为准）；selected.json 的值可为单帧路径或 ≤3 帧路径列表（多帧同时作参考图，
-给模型更多服装证据）。场景卡仍走纯文生图。
+给模型更多服装证据）。场景卡仍走纯文生图。启用产品替换时，角色图与场景图都不保留原片产品，
+产品身份只由 index.json 中产品卡对应的 1-3 张用户原图定义。
 
 用法:
-  python3 generate_ref_images.py --cards 分镜大纲.md --output ./refs --frames-index refs/frames/selected.json
+  python3 generate_ref_images.py --cards 分镜大纲.md --output ./refs --frames-index refs/frames/selected.json \
+      --product-images 产品正面.jpg 产品侧面.jpg
   python3 generate_ref_images.py --cards 分镜大纲.md --output ./refs --only "猪头妖" --frames-index refs/frames/selected.json
   python3 generate_ref_images.py --cards 分镜大纲.md --output ./refs --ref-image xxx.jpg   # 手动指定统一参考图（覆盖 frames-index）
 
@@ -24,7 +26,9 @@ import json
 import time
 import base64
 import argparse
+import shutil
 import urllib.request
+import urllib.parse
 
 try:
     import dashscope
@@ -37,8 +41,9 @@ except ImportError:
 
 dashscope.base_http_api_url = "https://dashscope.aliyuncs.com/api/v1"
 
-CARD_HEAD_RE = re.compile(r"【(角色卡|场景卡)\s*[-—–]\s*([^】]+)】")
-STOP_PREFIXES = ("标签：", "标签:", "出现镜头", "适用镜头", "---", "===")
+CARD_HEAD_RE = re.compile(r"【(角色卡|场景卡|产品卡)\s*[-—–]\s*([^】]+)】")
+STOP_PREFIXES = ("标签：", "标签:", "出现镜头", "适用镜头", "替换对象", "替换镜头", "状态映射", "参考图片", "---", "===")
+MAX_PRODUCT_IMAGES = 3
 
 # size 表达因模型家族而异：wan 系用档位（如 2K），qwen-image 系用 宽*高
 QWEN_IMAGE_SIZE_MAP = {"2K": "2048*2048", "1K": "1328*1328"}
@@ -48,6 +53,11 @@ I2I_PREFIX = ("参考图是该角色在原片中的真实截图帧：面部特�
               "不得美化或替换长相；当以下文字描述与参考帧在服装细节上不一致时（款式、纹理、针织粗细、颜色、"
               "开合状态、纽扣数量与样式、配饰等），一律以参考帧为准，文字只规定构图、姿态、背景与表情。"
               "构图、姿态、背景与画面风格按以下文字描述执行。")
+
+PRODUCT_ROLE_PREFIX = ("本任务启用了独立产品替换：参考帧中的原产品不属于角色外观，标准角色参考图只保留人物本身，"
+                       "不要保留手中、身旁或前景里的原产品；手部姿态自然，产品将在生视频阶段由独立产品参考图加入。")
+PRODUCT_SCENE_PREFIX = ("本任务启用了独立产品替换：场景参考图只保留承载产品的桌面、货架或空间结构，"
+                        "画面中不出现原片产品，也不提前生成替换产品；产品将在生视频阶段由独立产品参考图加入。")
 
 
 def is_qwen_image(model):
@@ -87,7 +97,7 @@ def load_ref_image(path_or_url):
 
 
 def parse_cards(md_text):
-    """解析角色卡/场景卡：返回 [{type, name, prompt}]"""
+    """解析角色卡/场景卡/产品卡：返回 [{type, name, prompt}]"""
     cards = []
     matches = list(CARD_HEAD_RE.finditer(md_text))
     for i, m in enumerate(matches):
@@ -123,6 +133,62 @@ def safe_path(path):
     while os.path.exists(f"{root}_{i}{ext}"):
         i += 1
     return f"{root}_{i}{ext}"
+
+
+def stage_product_images(images, output_dir):
+    """把用户产品原图复制/下载到 refs/products，并保证最短边达到视频参考图要求。"""
+    product_dir = os.path.join(output_dir, "products")
+    os.makedirs(product_dir, exist_ok=True)
+    paths = []
+    for i, source in enumerate(images, 1):
+        if source.startswith(("http://", "https://")):
+            ext = os.path.splitext(urllib.parse.urlparse(source).path)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                ext = ".jpg"
+        else:
+            if not os.path.exists(source):
+                print(f"ERROR: 产品图片不存在: {source}")
+                sys.exit(1)
+            ext = os.path.splitext(source)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                print(f"ERROR: 不支持的产品图片格式: {source}（支持 jpg/jpeg/png/webp/bmp）")
+                sys.exit(1)
+        save = safe_path(os.path.join(product_dir, f"产品参考_{i}{ext}"))
+        try:
+            if source.startswith(("http://", "https://")):
+                urllib.request.urlretrieve(source, save)
+            else:
+                shutil.copy2(source, save)
+            try:
+                from PIL import Image
+                with Image.open(save) as img:
+                    w, h = img.size
+                    processed = img.copy()
+                    changed = False
+                    if min(w, h) < 240:
+                        scale = 240 / min(w, h)
+                        processed = processed.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+                        changed = True
+                    if processed.mode in ("RGBA", "LA") or (processed.mode == "P" and "transparency" in img.info):
+                        rgba = processed.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, "white")
+                        bg.paste(rgba, mask=rgba.getchannel("A"))
+                        processed = bg
+                        changed = True
+                    if changed:
+                        fmt = "JPEG" if ext in (".jpg", ".jpeg") else img.format or "PNG"
+                        save_kwargs = {"quality": 95} if fmt == "JPEG" else {}
+                        processed.save(save, format=fmt, **save_kwargs)
+                    if min(w, h) < 240:
+                        print(f"  ! 产品图{i}过小({w}x{h})，已放大至 {processed.size[0]}x{processed.size[1]}")
+            except ImportError:
+                print("  ! pillow 未安装，未检查产品图尺寸（视频参考图最短边需≥240px）")
+            print(f"  ✓ 产品参考图{i}: {save}")
+            paths.append(save)
+        except Exception as e:
+            print(f"ERROR: 产品图片准备失败: {source}: {e}")
+            sys.exit(1)
+    return paths
 
 
 def gen_one(api_key, prompt, model, n, size, ref_image=None):
@@ -186,8 +252,8 @@ def gen_many(api_key, prompt, model, n, size, ref_image=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="角色卡/场景卡 → 参考图")
-    parser.add_argument("--cards", required=True, help="第一步产出的 markdown 文件（含角色卡/场景卡）")
+    parser = argparse.ArgumentParser(description="角色卡/场景卡 → 参考图；产品卡 → 用户产品原图索引")
+    parser.add_argument("--cards", required=True, help="第一步产出的 markdown 文件（含角色卡/场景卡，可含产品卡）")
     parser.add_argument("--output", required=True, help="参考图输出目录")
     parser.add_argument("--only", default=None, help="只生成卡名包含该关键词的卡")
     parser.add_argument("--model", default="qwen-image-3.0-pro")
@@ -198,11 +264,12 @@ def main():
     parser.add_argument("--frames-index", default=None,
                         help="抽帧定稿映射 selected.json（{\"角色卡-名\": 帧路径 或 [帧路径列表(≤3)]}），"
                              "角色卡按各自帧走 I2I（多帧时全部作为参考图）；--ref-image 优先于它")
+    parser.add_argument("--product-images", nargs="+", default=[],
+                        help="可选：同一目标产品的 1-3 张本地图片或 http(s) 链接；原图直接登记到产品卡，不经过生图")
     args = parser.parse_args()
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        print("ERROR: DASHSCOPE_API_KEY 环境变量未设置")
+    if len(args.product_images) > MAX_PRODUCT_IMAGES:
+        print(f"ERROR: 产品参考图最多 {MAX_PRODUCT_IMAGES} 张，请选择互补的正面/侧面/细节图")
         sys.exit(1)
 
     ref_image = load_ref_image(args.ref_image) if args.ref_image else None
@@ -212,11 +279,20 @@ def main():
             frames_map = json.load(f)
 
     with open(args.cards, "r", encoding="utf-8") as f:
-        cards = parse_cards(f.read())
+        all_cards = parse_cards(f.read())
+    all_product_cards = [c for c in all_cards if c["type"] == "产品卡"]
+    if len(all_product_cards) > 1:
+        print("ERROR: 当前流程一次只支持替换一个目标产品；检测到多张产品卡，请先明确原片产品与目标产品的映射")
+        sys.exit(1)
+    if args.product_images and not all_product_cards:
+        print("ERROR: 分镜大纲中没有【产品卡 - ...】。请带 --product-images 重新运行 step1 后再生成参考图")
+        sys.exit(1)
+
+    cards = all_cards
     if args.only:
         cards = [c for c in cards if args.only in c["name"]]
     if not cards:
-        print("ERROR: 未解析到任何角色卡/场景卡（或 --only 无匹配）。请检查文件格式：卡头须为【角色卡 - 名字】/【场景卡 - 名字】")
+        print("ERROR: 未解析到任何卡片（或 --only 无匹配）。卡头须为【角色卡 - 名字】/【场景卡 - 名字】/【产品卡 - 名字】")
         sys.exit(1)
 
     print(f"共解析到 {len(cards)} 张卡：" + "、".join(f"{c['type']}-{c['name']}" for c in cards))
@@ -228,7 +304,26 @@ def main():
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
 
-    for i, card in enumerate(cards):
+    product_mode = bool(all_product_cards)
+    product_cards = [c for c in cards if c["type"] == "产品卡"]
+    image_cards = [c for c in cards if c["type"] != "产品卡"]
+    for product_card in product_cards:
+        key = f"产品卡-{product_card['name']}"
+        if args.product_images:
+            print(f"\n[产品卡] {product_card['name']}（多图共同定义同一个产品，不生成候选图）")
+            index[key] = stage_product_images(args.product_images, args.output)
+        elif key in index and index[key]:
+            print(f"\n[产品卡] {product_card['name']}：沿用 index.json 中已有的 {len(index[key])} 张产品原图")
+        else:
+            print(f"ERROR: {key} 尚无产品参考图，请传 --product-images")
+            sys.exit(1)
+
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if image_cards and not api_key:
+        print("ERROR: DASHSCOPE_API_KEY 环境变量未设置")
+        sys.exit(1)
+
+    for i, card in enumerate(image_cards):
         card_ref = None
         prompt = card["prompt"]
         key = f"{card['type']}-{card['name']}"
@@ -240,8 +335,12 @@ def main():
                 frame_paths = frame_paths[:3]  # qwen-image I2I 参考图上限 3 张
                 card_ref = [load_ref_image(p) for p in frame_paths]
                 prompt = I2I_PREFIX + prompt
+            if product_mode:
+                prompt = PRODUCT_ROLE_PREFIX + prompt
+        elif product_mode and card["type"] == "场景卡":
+            prompt = PRODUCT_SCENE_PREFIX + prompt
         suffix = f"（I2I 参考帧: {'、'.join(frame_paths)}）" if card_ref else ""
-        print(f"\n[{i+1}/{len(cards)}] {card['type']} - {card['name']}{suffix}")
+        print(f"\n[{i+1}/{len(image_cards)}] {card['type']} - {card['name']}{suffix}")
         urls = gen_many(api_key, prompt, args.model, args.n, args.size, ref_image=card_ref)
         paths = []
         for j, url in enumerate(urls):
@@ -254,7 +353,7 @@ def main():
                 print(f"  ✗ 下载失败: {e}\n    URL(24h有效，可手动下载): {url}")
         if paths:
             index[f"{card['type']}-{card['name']}"] = paths
-        if i < len(cards) - 1:
+        if i < len(image_cards) - 1:
             time.sleep(2)  # 频控间隔
 
     with open(index_path, "w", encoding="utf-8") as f:

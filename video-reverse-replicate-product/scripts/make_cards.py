@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-视频逆向复刻 - 角色卡/场景卡精修（qwen3.8-max）
+视频逆向复刻 - 角色卡/场景卡/产品卡精修（qwen3.8-max）
 
 在 omni 完成第一步（分镜大纲+初版卡）后，用强文本模型 qwen3.8-max
-把角色卡/场景卡改写成对文生图更友好的高质量 Prompt。
+把角色卡/场景卡改写成对文生图更友好的高质量 Prompt；产品卡只做事实保真与格式整理。
 分镜大纲部分原样保留（程序级拼接，模型碰不到分镜正文的写回）。
 
 用法:
@@ -29,7 +29,7 @@ PROMPT_DIR = os.path.join(SCRIPT_DIR, "..", "prompts")
 
 # 匹配"第二部分"标题行（### 第二部分 / **第二部分** 等变体）
 PART2_RE = re.compile(r"^[#*\s]*第二部分", re.MULTILINE)
-CARD_HEAD_RE = re.compile(r"【(角色卡|场景卡)\s*[-—–]\s*([^】]+)】")
+CARD_HEAD_RE = re.compile(r"【(角色卡|场景卡|产品卡)\s*[-—–]\s*([^】]+)】")
 
 
 def load_system_prompt():
@@ -59,14 +59,14 @@ def refine(step1_text, model):
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     user_prompt = (
-        "以下是视频理解模型产出的第一步完整结果（分镜大纲+初版角色卡+初版场景卡），"
+        "以下是视频理解模型产出的第一步完整结果（分镜大纲+初版角色卡+初版场景卡，可能含产品卡），"
         "其中的卡描述可能已被用户手工修正过（须视为最高优先级事实）：\n\n"
         "===== 第一步产出 开始 =====\n"
         f"{step1_text}\n"
         "===== 第一步产出 结束 =====\n\n"
-        "请按系统提示词要求，改写所有角色卡与场景卡为高质量文生图 Prompt。"
-        "只输出'### 第二部分：角色卡'与'### 第三部分：场景卡'两部分，"
-        "卡名、卡数、标签行、出现/适用镜头行严格保持原样。"
+        "请按系统提示词要求，改写所有角色卡与场景卡为高质量文生图 Prompt；产品卡只做忠实压缩。"
+        "输出'### 第二部分：角色卡'、'### 第三部分：场景卡'，以及输入中存在的'### 第四部分：产品卡'，"
+        "卡名、卡数及标签/出现镜头/适用镜头/替换对象/替换镜头/状态映射行严格保持原样。"
     )
     completion = client.chat.completions.create(
         model=model,
@@ -91,7 +91,7 @@ def refine(step1_text, model):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="用 qwen3.8-max 精修角色卡/场景卡")
+    parser = argparse.ArgumentParser(description="用 qwen3.8-max 精修角色卡/场景卡/产品卡")
     parser.add_argument("--step1-file", required=True, help="omni 第一步产出的分镜大纲.md")
     parser.add_argument("--output", required=True, help="精修后完整文档保存路径（不覆盖已有文件）")
     parser.add_argument("--model", default="qwen3.8-max")
@@ -115,7 +115,7 @@ def main():
 
     orig_cards = card_names(step1_text)
     if not orig_cards:
-        print("ERROR: 第一步产出中未解析到任何角色卡/场景卡")
+        print("ERROR: 第一步产出中未解析到任何角色卡/场景卡/产品卡")
         sys.exit(1)
 
     refined = refine(step1_text, args.model)
@@ -126,10 +126,10 @@ def main():
     refined = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", refined.strip())
 
     new_cards = card_names(refined)
-    if [n for _, n in new_cards] != [n for _, n in orig_cards]:
-        print("\nWARNING: 精修后卡名/卡数与初版不一致！")
-        print(f"  初版: {[n for _, n in orig_cards]}")
-        print(f"  精修: {[n for _, n in new_cards]}")
+    if new_cards != orig_cards:
+        print("\nWARNING: 精修后卡类型/卡名/卡数与初版不一致！")
+        print(f"  初版: {orig_cards}")
+        print(f"  精修: {new_cards}")
         print("  下游按卡名引用，请人工核对后再继续。")
 
     merged = head + "\n\n---\n\n" + refined + "\n"

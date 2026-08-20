@@ -2,7 +2,7 @@
 """
 视频逆向复刻 - 分镜视频生成（参考生视频 R2V，默认 wan3.0-video，--model 可覆盖）
 
-用角色/场景参考图 + 分镜 Prompt 生成单个生成段的视频。
+用角色/产品/场景参考图 + 分镜 Prompt 生成单个生成段的视频。
 注意：Prompt 中须用「图1」「图2」引用参考图，序号 = --refs 传入顺序。
 
 用法:
@@ -73,7 +73,7 @@ def main():
                         help="视频生成模型名（默认 wan3.0-video，可覆盖）")
     parser.add_argument("--prompt", default=None, help="分镜生视频 Prompt（与 --prompt-file 二选一）")
     parser.add_argument("--prompt-file", default=None, help="从文件读取 Prompt")
-    parser.add_argument("--refs", nargs="+", default=[], help="参考图路径/URL 列表（≤10张，顺序即 图1/图2/...）")
+    parser.add_argument("--refs", nargs="+", default=[], help="角色/产品/场景参考图路径或URL（≤10张，顺序即 图1/图2/...）")
     parser.add_argument("--duration", type=int, default=5, help="输出时长秒 [2,30]，按镜头时长向上取整；-1=智能时长")
     parser.add_argument("--resolution", default="1080P", choices=["1080P", "720P", "480P"])
     parser.add_argument("--ratio", default="adaptive")
