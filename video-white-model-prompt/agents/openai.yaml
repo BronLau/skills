@@ -1,6 +1,6 @@
 interface:
   display_name: "视频白模与提示词反推"
-  short_description: "将视频生成单目深度白模，并按相同分段输出可复制的视频生成提示词"
-  default_prompt: "使用 $video-white-model-prompt 将我上传的视频生成白模，并按需反推匹配的分段提示词。"
+  short_description: "生成视频深度白模，并由 Omni 听音、Max 看图精修匹配的分段提示词"
+  default_prompt: "使用 $video-white-model-prompt 将我上传的视频生成白模，并由 Omni 生成视听初稿、Max 精修匹配的分段提示词。"
 policy:
   allow_implicit_invocation: true
