@@ -22,6 +22,7 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/bmp",
     "image/gif",
 }
+SEEDANCE_MAX_IMAGE_BYTES = 30 * 1024 * 1024
 SAMPLE_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 SAMPLE_TIME_OFFSETS = (-0.08, 0.0, 0.08)
 
@@ -158,6 +159,28 @@ def validate_image_input(path: Path, label: str, inline_limit_mb: float) -> None
         raise MediaPreflightError(f"{label}宽高必须都大于 10 像素：{width}x{height}")
     if max(width / height, height / width) > 200:
         raise MediaPreflightError(f"{label}宽高比不能超过 200:1：{width}x{height}")
+
+
+def validate_seedance_image_input(path: Path, label: str) -> None:
+    if path.stat().st_size >= SEEDANCE_MAX_IMAGE_BYTES:
+        raise MediaPreflightError(f"{label}必须小于 30 MB：{path}")
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise MediaPreflightError("Seedance 图片预检需要 Pillow。") from exc
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            image.verify()
+    except Exception as exc:
+        raise MediaPreflightError(f"{label}无法读取：{path}：{exc}") from exc
+    ratio = width / height
+    if not 300 <= width <= 6000 or not 300 <= height <= 6000:
+        raise MediaPreflightError(
+            f"{label}宽高必须都在 300 到 6000 像素之间：{width}x{height}"
+        )
+    if not 0.4 <= ratio <= 2.5:
+        raise MediaPreflightError(f"{label}宽高比必须在 0.4 到 2.5 之间：{ratio:.3f}")
 
 
 def _normalized_gray(frame: Any) -> Any:

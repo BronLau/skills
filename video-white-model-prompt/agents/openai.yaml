@@ -1,6 +1,6 @@
 interface:
-  display_name: "视频白模与提示词反推"
-  short_description: "生成视频深度白模，并由 Omni 听音、Max 看图精修匹配的分段提示词"
-  default_prompt: "使用 $video-white-model-prompt 将我上传的视频生成白模，并由 Omni 生成视听初稿、Max 精修匹配的分段提示词。"
+  display_name: "视频白模与 Seedance 成片"
+  short_description: "生成深度白模，或反推视听提示词后调用 Seedance 2.5 成片"
+  default_prompt: "使用 $video-white-model-prompt 处理我上传的视频，并按我选择生成白模或 Seedance 2.5 分段成片。"
 policy:
   allow_implicit_invocation: true

@@ -1,2 +1,5 @@
 openai>=2.0.0
 Pillow>=10.0.0
+tos>=2.9.0
+volcengine>=1.0.215
+volcengine-python-sdk[ark]>=5.0.25

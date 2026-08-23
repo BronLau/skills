@@ -193,6 +193,7 @@ class PipelinePromptTests(unittest.TestCase):
         max_result: str = "镜头1[00:00-00:10] 最终精修内容",
         omni_finish_reason: str = "stop",
         max_finish_reason: str = "stop",
+        max_repair_result: str | None = None,
     ) -> tuple[int, mock.Mock, mock.Mock]:
         omni_mock = mock.Mock(
             return_value=(
@@ -200,25 +201,34 @@ class PipelinePromptTests(unittest.TestCase):
                 {"model": args.omni_model, "finish_reason": omni_finish_reason},
             )
         )
-        max_mock = mock.Mock(
-            return_value=(
-                max_result,
+        def max_response(content: str) -> tuple[str, dict[str, object]]:
+            return (
+                content,
                 {
                     "choices": [
                         {
-                            "message": {"content": max_result},
+                            "message": {"content": content},
                             "finish_reason": max_finish_reason,
                         }
                     ]
                 },
             )
+
+        max_mock = (
+            mock.Mock(side_effect=[max_response(max_result), max_response(max_repair_result)])
+            if max_repair_result is not None
+            else mock.Mock(return_value=max_response(max_result))
         )
+        metadata = self.metadata(has_audio)
+        if args.duration_seconds is not None:
+            metadata["source_duration"] = float(args.duration_seconds)
+            metadata["duration_seconds"] = int(args.duration_seconds)
         patches = [
             mock.patch.object(MODULE, "parse_args", return_value=args),
             mock.patch.object(
                 MODULE,
                 "probe_video",
-                return_value=self.metadata(has_audio),
+                return_value=metadata,
             ),
             mock.patch.object(
                 MODULE, "file_to_data_url", return_value="data:video/mp4;base64,AAAA"
@@ -254,6 +264,29 @@ class PipelinePromptTests(unittest.TestCase):
             max_user_text = max_user_content[-1]["text"]
             self.assertIn("视觉精修终稿", max_system)
             self.assertIn(draft, max_user_text)
+            self.assertIn("locked_spoken_content", max_user_text)
+
+    def test_runtime_context_declares_exact_segments_and_available_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.segment_max_seconds = 30
+
+            no_image_text = MODULE.build_draft_user_text(args, "9:16", 41, "")
+            self.assertIn("required_segment_count：2", no_image_text)
+            self.assertIn("本次必须恰好输出2段", no_image_text)
+            self.assertIn(
+                "available_image_references：空；所有主体使用纯文本定义。",
+                no_image_text,
+            )
+            self.assertIn("仅用于构图推理；提示词正文不复述该比例", no_image_text)
+
+            args.character_image = root / "character.png"
+            args.product_image = [root / "product-1.png", root / "product-2.png"]
+            image_text = MODULE.build_draft_user_text(args, "9:16", 41, "")
+            self.assertIn("@图片1=人物形象图", image_text)
+            self.assertIn("@图片2=第1张产品参考图", image_text)
+            self.assertIn("@图片3=第2张产品参考图", image_text)
 
     def test_silent_video_skips_omni(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -273,13 +306,25 @@ class PipelinePromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self.make_args(root)
+            args.duration_seconds = 20
             omni_draft = (
-                "【第一段提示词（5秒，对齐参考视频0-5秒）】\n"
-                "镜头1[00:00-00:05] 初稿第一段\n"
-                "【第二段提示词（5秒，对齐参考视频5-10秒）】\n"
-                "镜头1[00:00-00:05] 初稿第二段"
+                "【第一段提示词（10秒，对齐参考视频0-10秒）】\n"
+                "镜头1[00:00-00:10] 初稿第一段\n"
+                "【第二段提示词（10秒，对齐参考视频10-20秒）】\n"
+                "镜头1[00:00-00:10] 初稿第二段"
             )
-            code, _, _ = self.run_main(args, True, omni_draft)
+            moved_final = (
+                "【第一段提示词（9秒，对齐参考视频0-9秒）】\n"
+                "镜头1[00:00-00:09] 终稿第一段\n"
+                "【第二段提示词（11秒，对齐参考视频9-20秒）】\n"
+                "镜头1[00:00-00:11] 终稿第二段"
+            )
+            code, _, _ = self.run_main(
+                args,
+                True,
+                omni_result=omni_draft,
+                max_result=moved_final,
+            )
 
             self.assertEqual(code, 1)
             self.assertTrue(args.candidate_output.is_file())
@@ -368,6 +413,29 @@ class PipelinePromptTests(unittest.TestCase):
             )
             self.assertFalse(args.segment_plan_output.exists())
 
+    def test_invalid_max_output_is_repaired_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            invalid = (
+                "镜头1[00:00-00:08] 候选第一镜头\n"
+                "镜头2[00:08-00:11] 候选第二镜头"
+            )
+            repaired = "镜头1[00:00-00:10] 修复后的完整终稿"
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                max_result=invalid,
+                max_repair_result=repaired,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(max_mock.call_count, 2)
+            self.assertEqual(args.output.read_text(encoding="utf-8").strip(), repaired)
+            repair_payload = max_mock.call_args_list[1].args[2]
+            repair_text = repair_payload["messages"][-1]["content"]
+            self.assertIn("超出本段时长", repair_text)
+
     def test_max_truncation_keeps_candidate_and_rejects_final(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -409,10 +477,162 @@ class PipelinePromptTests(unittest.TestCase):
         with self.assertRaises(MODULE.ScriptError):
             MODULE.build_segment_plan(result, 10, 10.0, 15)
 
+    def test_image_reference_contract_matches_every_segment(self) -> None:
+        two_segments = (
+            "【第一段提示词（5秒，对齐参考视频0-5秒）】\n"
+            "参考@图片1。镜头1[00:00-00:05] 第一段\n"
+            "【第二段提示词（5秒，对齐参考视频5-10秒）】\n"
+            "参考@图片1。镜头1[00:00-00:05] 第二段"
+        )
+        MODULE.validate_image_reference_contract(two_segments, 1, "测试稿")
+
+        with self.assertRaisesRegex(MODULE.ScriptError, "实际输入不一致"):
+            MODULE.validate_image_reference_contract(two_segments, 0, "测试稿")
+
+        missing_second = two_segments.replace("参考@图片1。镜头1", "镜头1", 1)
+        with self.assertRaisesRegex(MODULE.ScriptError, "实际输入不一致"):
+            MODULE.validate_image_reference_contract(missing_second, 1, "测试稿")
+
+        with self.assertRaisesRegex(MODULE.ScriptError, "缺少 @ 前缀"):
+            MODULE.validate_image_reference_contract(
+                "镜头1[00:00-00:10] 参考图片1。",
+                1,
+                "测试稿",
+            )
+
+    def test_contract_repair_messages_request_complete_rewrite(self) -> None:
+        messages = [{"role": "system", "content": "system"}]
+        repaired = MODULE.build_contract_repair_messages(
+            messages,
+            "候选正文",
+            "镜头超出段时长",
+            "Max 最终提示词",
+        )
+        self.assertEqual(repaired[-2]["role"], "assistant")
+        self.assertEqual(repaired[-2]["content"], "候选正文")
+        self.assertIn("镜头超出段时长", repaired[-1]["content"])
+        self.assertIn("完整重写正文", repaired[-1]["content"])
+
+        with_spoken = MODULE.build_contract_repair_messages(
+            messages,
+            "候选正文",
+            "台词漂移",
+            "Max 最终提示词",
+            "locked_spoken_content：\n1. {原始台词}",
+        )
+        self.assertIn("1. {原始台词}", with_spoken[-1]["content"])
+
+    def test_spoken_content_ignores_punctuation_but_rejects_changed_words(self) -> None:
+        draft = "镜头1[00:00-00:10] {很多姐妹，都问我！}{看一下啊}"
+        same = "镜头1[00:00-00:10] {很多姐妹都问我 看一下啊}"
+        MODULE.require_same_spoken_content(draft, same)
+
+        with self.assertRaisesRegex(MODULE.ScriptError, "改变了 Omni 初稿"):
+            MODULE.require_same_spoken_content(
+                draft,
+                "镜头1[00:00-00:10] {很多姐妹都问我 看一下吧}",
+            )
+
+        draft_segments = (
+            "【第一段提示词（5秒，对齐参考视频0-5秒）】\n"
+            "镜头1[00:00-00:05] {第一段台词}\n"
+            "【第二段提示词（5秒，对齐参考视频5-10秒）】\n"
+            "镜头1[00:00-00:05] {第二段台词}"
+        )
+        moved_across_split = (
+            "【第一段提示词（5秒，对齐参考视频0-5秒）】\n"
+            "镜头1[00:00-00:05] {第一段台词 第二段}\n"
+            "【第二段提示词（5秒，对齐参考视频5-10秒）】\n"
+            "镜头1[00:00-00:05] {台词}"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, "第1段"):
+            MODULE.require_same_spoken_content(draft_segments, moved_across_split)
+
+        contract = MODULE.spoken_content_contract(draft_segments)
+        self.assertIn("第1段：", contract)
+        self.assertIn("第2段：", contract)
+
+    def test_api_control_literals_are_rejected_from_prompt_body(self) -> None:
+        MODULE.validate_no_api_control_literals(
+            "镜头1[00:00-00:10] 竖屏近景，真实摄影质感。",
+            "测试稿",
+        )
+        for literal in ("9:16竖屏", "输出720p", "4K画质"):
+            with self.subTest(literal=literal):
+                with self.assertRaisesRegex(MODULE.ScriptError, "Seedance API 控制"):
+                    MODULE.validate_no_api_control_literals(literal, "测试稿")
+
+    def test_changed_audio_is_repaired_once_without_rewrite_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            draft = "镜头1[00:00-00:10] {原始台词}"
+            changed = "镜头1[00:00-00:10] {修改台词}"
+            repaired = "镜头1[00:00-00:10] {原始台词}"
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=draft,
+                max_result=changed,
+                max_repair_result=repaired,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(max_mock.call_count, 2)
+            repair_payload = max_mock.call_args_list[1].args[2]
+            self.assertIn(
+                "改变了 Omni 初稿第1段的台词原文",
+                repair_payload["messages"][-1]["content"],
+            )
+
     def test_segment_plan_rejects_shot_gap(self) -> None:
         result = "镜头1[00:00-00:04] 第一镜头\n镜头2[00:05-00:10] 第二镜头"
         with self.assertRaises(MODULE.ScriptError):
             MODULE.build_segment_plan(result, 10, 10.0, 15)
+
+    def test_segment_plan_uses_minimum_count_and_rejects_short_tail(self) -> None:
+        valid = (
+            "【第一段提示词（27秒，对齐参考视频0-27秒）】\n"
+            "镜头1[00:00-00:27] 第一段\n"
+            "【第二段提示词（4秒，对齐参考视频27-31秒）】\n"
+            "镜头1[00:00-00:04] 第二段"
+        )
+        plan = MODULE.build_segment_plan(valid, 31, 30.8, 30)
+        self.assertEqual(plan["expected_segment_count"], 2)
+        self.assertEqual(
+            [segment["duration_seconds"] for segment in plan["segments"]],
+            [27.0, 4.0],
+        )
+
+        short_tail = (
+            "【第一段提示词（30秒，对齐参考视频0-30秒）】\n"
+            "镜头1[00:00-00:30] 第一段\n"
+            "【第二段提示词（1秒，对齐参考视频30-31秒）】\n"
+            "镜头1[00:00-00:01] 第二段"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, "4 到 30"):
+            MODULE.build_segment_plan(short_tail, 31, 30.8, 30)
+
+    def test_segment_plan_rejects_extra_or_fractional_segments(self) -> None:
+        extra = (
+            "【第一段提示词（10秒，对齐参考视频0-10秒）】\n"
+            "镜头1[00:00-00:10] 第一段\n"
+            "【第二段提示词（10秒，对齐参考视频10-20秒）】\n"
+            "镜头1[00:00-00:10] 第二段"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, "最少段数"):
+            MODULE.build_segment_plan(extra, 20, 20.0, 30)
+
+        fractional = (
+            "【第一段提示词（10.5秒，对齐参考视频0-10.5秒）】\n"
+            "镜头1[00:00:00-00:00:10.5] 第一段\n"
+            "【第二段提示词（10.5秒，对齐参考视频10.5-21秒）】\n"
+            "镜头1[00:00:00-00:00:10.5] 第二段\n"
+            "【第三段提示词（10秒，对齐参考视频21-31秒）】\n"
+            "镜头1[00:00-00:10] 第三段"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, "整数秒"):
+            MODULE.build_segment_plan(fractional, 31, 31.0, 15)
 
     def test_reuses_verified_draft_without_omni_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

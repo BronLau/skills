@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run depth inference and optional Qwen prompt reversal as one coordinated job."""
+"""Run depth, Qwen prompt reversal, and Seedance request preparation."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from media_preflight import (
     probe_video_signature,
     validate_analysis_video as validate_analysis_video_shared,
     validate_image_input as validate_image_input_shared,
+    validate_seedance_image_input as validate_seedance_image_input_shared,
 )
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEPTH_SCRIPT = SKILL_DIR / "scripts" / "depth_video_pipeline.py"
 QWEN_SCRIPT = SKILL_DIR / "scripts" / "qwen_video_prompt_reverse.py"
+SEEDANCE_SCRIPT = SKILL_DIR / "scripts" / "seedance_video_pipeline.py"
 SYSTEM_PROMPT = SKILL_DIR / "prompts" / "video_reverse_system_prompt.txt"
 MODEL_NAME = "depth_anything_v2_vits.onnx"
 LOCAL_MODEL_FALLBACK = Path(
@@ -49,7 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--analysis-video", type=Path)
     parser.add_argument(
         "--scope",
-        choices=("depth-only", "depth-and-prompt"),
+        choices=(
+            "depth-only",
+            "depth-prompt-seedance",
+            "prompt-seedance",
+        ),
         required=True,
     )
     parser.add_argument(
@@ -74,6 +80,26 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_INLINE_LIMIT_MB,
     )
     parser.add_argument("--max-tokens", type=int, default=32768)
+    parser.add_argument(
+        "--seedance-resolution",
+        choices=("480p", "720p", "1080p"),
+        default="720p",
+    )
+    parser.add_argument(
+        "--seedance-ratio",
+        choices=("source", "adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        default="source",
+    )
+    parser.add_argument(
+        "--seedance-output-format", choices=("mp4", "mov"), default="mp4"
+    )
+    parser.add_argument(
+        "--seedance-generate-audio",
+        choices=("auto", "true", "false"),
+        default="auto",
+    )
+    parser.add_argument("--seedance-watermark", action="store_true")
+    parser.add_argument("--seedance-seed", type=int)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -99,6 +125,13 @@ def validate_analysis_video(
 def validate_image_input(path: Path, label: str, inline_limit_mb: float) -> None:
     try:
         validate_image_input_shared(path, label, inline_limit_mb)
+    except MediaPreflightError as exc:
+        raise PipelineError(str(exc)) from exc
+
+
+def validate_seedance_image_input(path: Path, label: str) -> None:
+    try:
+        validate_seedance_image_input_shared(path, label)
     except MediaPreflightError as exc:
         raise PipelineError(str(exc)) from exc
 
@@ -135,12 +168,13 @@ def resolve_depth_model(explicit: Path | None) -> Path:
     )
 
 
-def prepare_output_dir(path: Path, resume: bool) -> Path:
+def prepare_output_dir(path: Path, resume: bool, with_depth: bool) -> Path:
     resolved = path.expanduser().resolve()
     if resume:
         if not resolved.is_dir():
             raise PipelineError(f"恢复运行要求输出目录已存在：{resolved}")
-        (resolved / "depth").mkdir(exist_ok=True)
+        if with_depth:
+            (resolved / "depth").mkdir(exist_ok=True)
         return resolved
     if resolved.exists():
         if not resolved.is_dir():
@@ -148,7 +182,8 @@ def prepare_output_dir(path: Path, resume: bool) -> Path:
         if any(resolved.iterdir()):
             raise PipelineError(f"输出目录不是空目录，拒绝覆盖：{resolved}")
     resolved.mkdir(parents=True, exist_ok=True)
-    (resolved / "depth").mkdir(exist_ok=True)
+    if with_depth:
+        (resolved / "depth").mkdir(exist_ok=True)
     return resolved
 
 
@@ -168,13 +203,13 @@ def run_manifest(
     args: argparse.Namespace,
     video: Path,
     analysis_video: Path,
-    model: Path,
+    model: Path | None,
     character_image: Path | None,
     product_images: list[Path],
     transcript_file: Path | None,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "video": file_identity(video),
         "analysis_video": file_identity(analysis_video),
         "scope": args.scope,
@@ -186,6 +221,16 @@ def run_manifest(
         "user_idea": args.user_idea.strip(),
         "transcript_file": file_identity(transcript_file),
         "depth_model": file_identity(model),
+        "seedance": {
+            "resolution": args.seedance_resolution,
+            "ratio": args.seedance_ratio,
+            "output_format": args.seedance_output_format,
+            "generate_audio": args.seedance_generate_audio,
+            "watermark": bool(args.seedance_watermark),
+            "seed": args.seedance_seed,
+        }
+        if args.scope != "depth-only"
+        else None,
     }
 
 
@@ -234,6 +279,7 @@ def validate_completed_outputs(
     prompt_path: Path,
     plan_path: Path,
     depth_files: list[Path],
+    depth_required: bool = True,
 ) -> None:
     if not prompt_path.is_file() or prompt_path.stat().st_size == 0:
         raise PipelineError("完成标记存在，但正式提示词缺失或为空。")
@@ -244,13 +290,64 @@ def validate_completed_outputs(
         expected_count = len(plan["segments"])
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise PipelineError("完成标记存在，但分段计划无效。") from exc
-    if expected_count <= 0 or len(depth_files) != expected_count:
+    if expected_count <= 0:
+        raise PipelineError("完成标记存在，但分段计划为空。")
+    if depth_required and len(depth_files) != expected_count:
         raise PipelineError(
             "完成标记存在，但白模分段数量不匹配："
             f"{len(depth_files)} != {expected_count}"
         )
-    if any(path.stat().st_size == 0 for path in depth_files):
+    if depth_required and any(path.stat().st_size == 0 for path in depth_files):
         raise PipelineError("完成标记存在，但白模文件为空。")
+
+
+def build_seedance_prepare_command(
+    args: argparse.Namespace,
+    video: Path,
+    prompt_path: Path,
+    plan_path: Path,
+    output_dir: Path,
+    character_image: Path | None,
+    product_images: list[Path],
+    transcript_file: Path | None,
+    with_depth: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(SEEDANCE_SCRIPT),
+        "prepare",
+        "--prompt",
+        str(prompt_path),
+        "--segment-plan",
+        str(plan_path),
+        "--source-video",
+        str(video),
+        "--output-dir",
+        str(output_dir / "seedance"),
+        "--resolution",
+        args.seedance_resolution,
+        "--ratio",
+        args.seedance_ratio,
+        "--output-format",
+        args.seedance_output_format,
+        "--generate-audio",
+        args.seedance_generate_audio,
+    ]
+    if with_depth:
+        command.extend(["--depth-dir", str(output_dir / "depth")])
+    if character_image:
+        command.extend(["--character-image", str(character_image)])
+    for image in product_images:
+        command.extend(["--product-image", str(image)])
+    if transcript_file:
+        command.extend(["--transcript-file", str(transcript_file)])
+    if args.seedance_watermark:
+        command.append("--watermark")
+    if args.seedance_seed is not None:
+        command.extend(["--seed", str(args.seedance_seed)])
+    if args.resume:
+        command.append("--overwrite")
+    return command
 
 
 def run_process(command: list[str]) -> int:
@@ -260,8 +357,10 @@ def run_process(command: list[str]) -> int:
 def main() -> int:
     args = parse_args()
     try:
-        if args.resume and args.scope != "depth-and-prompt":
-            raise PipelineError("--resume 仅支持白模+提示词模式")
+        prompt_mode = args.scope != "depth-only"
+        with_depth = args.scope in {"depth-only", "depth-prompt-seedance"}
+        if args.resume and args.scope == "depth-only":
+            raise PipelineError("--resume 仅支持包含 Seedance 成片的模式")
         video = require_file(args.video, "参考视频")
         analysis_video = (
             require_file(args.analysis_video, "压缩分析视频")
@@ -296,9 +395,9 @@ def main() -> int:
         ):
             raise PipelineError("仅白模模式不接受提示词、图片、转写或 API Key 参数")
 
-        key_path = resolve_key_path(args.api_key_file)
-        model = resolve_depth_model(args.depth_model)
-        if args.scope == "depth-and-prompt":
+        key_path = resolve_key_path(args.api_key_file) if prompt_mode else None
+        model = resolve_depth_model(args.depth_model) if with_depth else None
+        if prompt_mode:
             if not 0 < args.max_inline_request_mb <= 9.5:
                 raise PipelineError("--max-inline-request-mb 必须在 0 到 9.5 之间")
             validate_analysis_video(
@@ -312,13 +411,18 @@ def main() -> int:
                     "人物形象图",
                     args.max_inline_request_mb,
                 )
+                validate_seedance_image_input(character_image, "人物形象图")
             for index, product_image in enumerate(product_images, start=1):
                 validate_image_input(
                     product_image,
                     f"第{index}张产品图",
                     args.max_inline_request_mb,
                 )
-        output_dir = prepare_output_dir(args.output_dir, args.resume)
+                validate_seedance_image_input(
+                    product_image,
+                    f"第{index}张产品图",
+                )
+        output_dir = prepare_output_dir(args.output_dir, args.resume, with_depth)
         manifest_path = output_dir / "run_manifest.json"
         expected_manifest = run_manifest(
             args,
@@ -336,6 +440,8 @@ def main() -> int:
         completion_path = output_dir / "completed.json"
 
         if args.scope == "depth-only":
+            if model is None:
+                raise PipelineError("内部错误：仅白模模式缺少深度模型")
             with tempfile.TemporaryDirectory(prefix="chuangliang-depth-") as work_dir:
                 depth_infer = [
                     sys.executable,
@@ -381,24 +487,30 @@ def main() -> int:
         prompt_path = output_dir / "prompt.txt"
         plan_path = output_dir / "segment_plan.json"
         work_dir = output_dir / ".depth_work"
-        current_depth_outputs = depth_outputs(output_dir / "depth", video)
+        current_depth_outputs = (
+            depth_outputs(output_dir / "depth", video) if with_depth else []
+        )
+        ready_path = output_dir / "ready_for_seedance.json"
+        seedance_plan_path = output_dir / "seedance" / "seedance_plan.json"
 
         prompt_complete = prompt_path.is_file() and plan_path.is_file()
-        cache_complete = depth_cache_complete(work_dir)
-        if args.resume and completion_path.is_file():
+        cache_complete = with_depth and depth_cache_complete(work_dir)
+        if args.resume and ready_path.is_file():
             validate_completed_outputs(
                 prompt_path,
                 plan_path,
                 current_depth_outputs,
+                depth_required=with_depth,
             )
-            print("PIPELINE already_complete", flush=True)
+            require_file(seedance_plan_path, "Seedance 请求计划")
+            print("PIPELINE already_ready_for_seedance", flush=True)
             return 0
 
         qwen_command: list[str] | None = None
         if not prompt_complete:
             if not os.environ.get("DASHSCOPE_API_KEY") and key_path is None:
                 raise PipelineError(
-                    "白模+提示词模式需要 DASHSCOPE_API_KEY 或 --api-key-file"
+                    "Seedance 成片模式需要 DASHSCOPE_API_KEY 或 --api-key-file"
                 )
             qwen_command = [
                 sys.executable,
@@ -471,7 +583,9 @@ def main() -> int:
                 )
 
         depth_infer: list[str] | None = None
-        if not cache_complete:
+        if with_depth and not cache_complete:
+            if model is None:
+                raise PipelineError("内部错误：白模成片模式缺少深度模型")
             work_dir.mkdir(parents=True, exist_ok=True)
             depth_infer = [
                 sys.executable,
@@ -510,58 +624,61 @@ def main() -> int:
             flush=True,
         )
 
-        encode_code = 1
-        if depth_code == 0:
+        encode_code: int | None = 0 if not with_depth else None
+        if with_depth and depth_code == 0 and qwen_code == 0 and plan_path.is_file():
             depth_dir = output_dir / "depth"
             existing_outputs = depth_outputs(depth_dir, video)
-            if qwen_code == 0 and plan_path.is_file():
-                if existing_outputs:
-                    archive_depth_outputs(output_dir, video)
-                depth_encode = [
-                    sys.executable,
-                    str(DEPTH_SCRIPT),
-                    "--mode",
-                    "encode",
-                    "--input",
-                    str(video),
-                    "--work-dir",
-                    str(work_dir),
-                    "--output-dir",
-                    str(output_dir / "depth"),
-                    "--segment-plan",
-                    str(plan_path),
-                ]
-                encode_code = run_process(depth_encode)
-            elif existing_outputs:
-                encode_code = 0
-            else:
-                depth_encode = [
-                    sys.executable,
-                    str(DEPTH_SCRIPT),
-                    "--mode",
-                    "encode",
-                    "--input",
-                    str(video),
-                    "--work-dir",
-                    str(work_dir),
-                    "--output-dir",
-                    str(depth_dir),
-                    "--segment-seconds",
-                    str(args.segment_max_seconds),
-                ]
-                encode_code = run_process(depth_encode)
+            if existing_outputs:
+                archive_depth_outputs(output_dir, video)
+            depth_encode = [
+                sys.executable,
+                str(DEPTH_SCRIPT),
+                "--mode",
+                "encode",
+                "--input",
+                str(video),
+                "--work-dir",
+                str(work_dir),
+                "--output-dir",
+                str(output_dir / "depth"),
+                "--segment-plan",
+                str(plan_path),
+            ]
+            encode_code = run_process(depth_encode)
 
         if qwen_code == 0 and depth_code == 0 and encode_code == 0:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            seedance_prepare = build_seedance_prepare_command(
+                args,
+                video,
+                prompt_path,
+                plan_path,
+                output_dir,
+                character_image,
+                product_images,
+                transcript_file,
+                with_depth,
+            )
+            prepare_code = run_process(seedance_prepare)
+            if prepare_code != 0:
+                raise PipelineError("Seedance 请求计划准备失败")
+            if with_depth:
+                shutil.rmtree(work_dir, ignore_errors=True)
             write_manifest(
-                completion_path,
-                {"schema_version": 1, "status": "complete", "scope": args.scope},
+                ready_path,
+                {
+                    "schema_version": 1,
+                    "status": "ready_for_confirmation",
+                    "scope": args.scope,
+                    "seedance_plan": str(seedance_plan_path),
+                },
             )
             return 0
 
+        encode_status = "skipped" if encode_code is None else str(encode_code)
         raise PipelineError(
             "流程未完全成功，已保留可恢复产物："
-            f"qwen={qwen_code}, depth_infer={depth_code}, depth_encode={encode_code}"
+            f"qwen={qwen_code}, depth_infer={depth_code}, "
+            f"depth_encode={encode_status}"
         )
     except PipelineError as exc:
         print(f"错误：{exc}", file=sys.stderr)
