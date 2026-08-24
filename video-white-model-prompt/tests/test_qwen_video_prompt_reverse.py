@@ -63,7 +63,10 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         self.__class__.requests.append(payload)
         model = payload["model"]
         if "omni" in model:
-            draft = "镜头1[00:00-00:10] 本地 SSE 视听初稿"
+            draft = (
+                "[[NO_SPEECH_CONFIRMED]]\n"
+                "镜头1[00:00-00:10] 本地 SSE 视听初稿"
+            )
             chunks = [
                 {
                     "id": "chatcmpl-omni",
@@ -155,6 +158,8 @@ class PipelinePromptTests(unittest.TestCase):
             product_name="",
             selling_points="",
             user_idea="",
+            allow_audio_rewrite=False,
+            spoken_replacement=[],
             transcript_file=None,
             output=root / "prompt.txt",
             draft_output=root / "prompt_draft.txt",
@@ -185,11 +190,30 @@ class PipelinePromptTests(unittest.TestCase):
             "has_audio": has_audio,
         }
 
+    def test_context_routes_target_generator_by_segment_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self.make_args(Path(temporary))
+            fifteen_second_context = MODULE.context_lines(args, "9:16", 10)
+            self.assertIn(
+                "target_generator：Doubao Seedance 2.0",
+                fifteen_second_context,
+            )
+
+            args.segment_max_seconds = 30
+            thirty_second_context = MODULE.context_lines(args, "9:16", 10)
+            self.assertIn(
+                "target_generator：Doubao Seedance 2.5",
+                thirty_second_context,
+            )
+
     def run_main(
         self,
         args: SimpleNamespace,
         has_audio: bool,
-        omni_result: str = "镜头1[00:00-00:10] 含台词和 BGM 的视听初稿",
+        omni_result: str = (
+            "[[NO_SPEECH_CONFIRMED]]\n"
+            "镜头1[00:00-00:10] 仅含 BGM 的视听初稿"
+        ),
         max_result: str = "镜头1[00:00-00:10] 最终精修内容",
         omni_finish_reason: str = "stop",
         max_finish_reason: str = "stop",
@@ -245,7 +269,10 @@ class PipelinePromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self.make_args(root)
-            draft = "镜头1[00:00-00:10] 含台词、BGM 和音效的视听初稿"
+            draft = (
+                "[[NO_SPEECH_CONFIRMED]]\n"
+                "镜头1[00:00-00:10] 含 BGM 和音效的视听初稿"
+            )
             code, omni_mock, max_mock = self.run_main(args, True, draft)
 
             self.assertEqual(code, 0)
@@ -265,6 +292,50 @@ class PipelinePromptTests(unittest.TestCase):
             self.assertIn("视觉精修终稿", max_system)
             self.assertIn(draft, max_user_text)
             self.assertIn("locked_spoken_content", max_user_text)
+
+    def test_omni_shot_structure_error_is_delegated_to_max(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            invalid_draft = "镜头1[00:00-00:11] {原始台词}"
+            repaired_final = "镜头1[00:00-00:10] {原始台词}"
+
+            code, omni_mock, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=invalid_draft,
+                max_result=repaired_final,
+            )
+
+            self.assertEqual(code, 0)
+            omni_mock.assert_called_once()
+            max_mock.assert_called_once()
+            self.assertEqual(
+                args.draft_output.read_text(encoding="utf-8").strip(),
+                invalid_draft,
+            )
+            max_payload = max_mock.call_args.args[2]
+            max_user_text = max_payload["messages"][1]["content"][-1]["text"]
+            self.assertIn("draft_structure_repair", max_user_text)
+            self.assertIn("超出本段时长", max_user_text)
+            self.assertIn("locked_segment_plan", max_user_text)
+
+    def test_omni_invalid_segment_headers_still_retry_omni(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.duration_seconds = 20
+            invalid_draft = "镜头1[00:00-00:20] {原始台词}"
+
+            code, omni_mock, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=invalid_draft,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(omni_mock.call_count, 2)
+            max_mock.assert_not_called()
 
     def test_runtime_context_declares_exact_segments_and_available_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -308,6 +379,7 @@ class PipelinePromptTests(unittest.TestCase):
             args = self.make_args(root)
             args.duration_seconds = 20
             omni_draft = (
+                "[[NO_SPEECH_CONFIRMED]]\n"
                 "【第一段提示词（10秒，对齐参考视频0-10秒）】\n"
                 "镜头1[00:00-00:10] 初稿第一段\n"
                 "【第二段提示词（10秒，对齐参考视频10-20秒）】\n"
@@ -435,6 +507,78 @@ class PipelinePromptTests(unittest.TestCase):
             repair_payload = max_mock.call_args_list[1].args[2]
             repair_text = repair_payload["messages"][-1]["content"]
             self.assertIn("超出本段时长", repair_text)
+
+    def test_segment_overview_is_rejected_and_repaired_by_max(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            invalid = (
+                "生成一条户外真实摄影风格的种草短视频，节奏轻快。\n"
+                "镜头1[00:00-00:10] 完整分镜"
+            )
+            repaired = "镜头1[00:00-00:10] 户外真实摄影，节奏轻快。"
+
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                max_result=invalid,
+                max_repair_result=repaired,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(max_mock.call_count, 2)
+            repair_payload = max_mock.call_args_list[1].args[2]
+            self.assertIn(
+                "镜头1前包含非主体定义内容",
+                repair_payload["messages"][-1]["content"],
+            )
+            self.assertNotIn(
+                "生成一条",
+                args.output.read_text(encoding="utf-8"),
+            )
+
+    def test_alternative_segment_overview_is_rejected(self) -> None:
+        result = (
+            "本段整体采用户外真实摄影风格。\n"
+            "镜头1[00:00-00:10] 户外人物展示。"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, "非主体定义内容"):
+            MODULE.validate_prompt_contract(result, 10, 10.0, 15, 0, "测试稿")
+
+    def test_omni_without_spoken_content_requires_confirmation_marker(self) -> None:
+        draft = "镜头1[00:00-00:10] 轻快 BGM。"
+        with self.assertRaisesRegex(MODULE.AudioFactError, "无人声确认标记"):
+            MODULE.validate_omni_audio_fact_coverage(draft)
+        confirmed = (
+            "[[NO_SPEECH_CONFIRMED]]\n"
+            "镜头1[00:00-00:10] 轻快 BGM。"
+        )
+        self.assertEqual(
+            MODULE.validate_omni_audio_fact_coverage(confirmed),
+            draft,
+        )
+
+    def test_max_cannot_change_valid_omni_shot_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            omni_draft = (
+                "[[NO_SPEECH_CONFIRMED]]\n"
+                "镜头1[00:00-00:04] 第一镜头。\n"
+                "镜头2[00:04-00:10] 第二镜头。"
+            )
+            merged_final = "镜头1[00:00-00:10] 合并后的镜头。"
+
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=omni_draft,
+                max_result=merged_final,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(max_mock.call_count, 2)
+            self.assertFalse(args.output.exists())
 
     def test_max_truncation_keeps_candidate_and_rejects_final(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -585,8 +729,86 @@ class PipelinePromptTests(unittest.TestCase):
                 repair_payload["messages"][-1]["content"],
             )
 
+    def test_product_name_alone_does_not_unlock_spoken_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.product_name = "收腹裤"
+            draft = "镜头1[00:00-00:10] {原始台词}"
+            changed = "镜头1[00:00-00:10] {修改台词}"
+            repaired = "镜头1[00:00-00:10] {原始台词}"
+
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=draft,
+                max_result=changed,
+                max_repair_result=repaired,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(max_mock.call_count, 2)
+            first_payload = max_mock.call_args_list[0].args[2]
+            first_user_text = first_payload["messages"][1]["content"][-1]["text"]
+            self.assertIn("未授权改写", first_user_text)
+            self.assertIn("locked_spoken_content", first_user_text)
+
+    def test_explicit_audio_rewrite_permission_unlocks_spoken_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.product_name = "收腹裤"
+            args.allow_audio_rewrite = True
+            draft = "镜头1[00:00-00:10] {原始台词}"
+            changed = "镜头1[00:00-00:10] {用户明确要求的新台词}"
+
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=draft,
+                max_result=changed,
+            )
+
+            self.assertEqual(code, 0)
+            max_mock.assert_called_once()
+            self.assertIn(
+                "用户明确要求的新台词",
+                args.output.read_text(encoding="utf-8"),
+            )
+
+    def test_explicit_spoken_replacement_allows_only_mapped_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.product_name = "收腹裤"
+            args.spoken_replacement = ["旧产品=收腹裤"]
+            draft = "镜头1[00:00-00:10] {这款旧产品很好穿}"
+            replaced = "镜头1[00:00-00:10] {这款收腹裤很好穿}"
+
+            code, _, max_mock = self.run_main(
+                args,
+                has_audio=True,
+                omni_result=draft,
+                max_result=replaced,
+            )
+
+            self.assertEqual(code, 0)
+            max_mock.assert_called_once()
+            max_payload = max_mock.call_args.args[2]
+            max_user_text = max_payload["messages"][1]["content"][-1]["text"]
+            self.assertIn("旧产品→收腹裤", max_user_text)
+            self.assertIn("{这款收腹裤很好穿}", max_user_text)
+            with self.assertRaisesRegex(MODULE.ScriptError, "改变了 Omni 初稿"):
+                MODULE.require_same_spoken_content(
+                    draft,
+                    "镜头1[00:00-00:10] {这款收腹裤非常好穿}",
+                    [("旧产品", "收腹裤")],
+                )
+
     def test_segment_plan_rejects_shot_gap(self) -> None:
         result = "镜头1[00:00-00:04] 第一镜头\n镜头2[00:05-00:10] 第二镜头"
+        header_plan = MODULE.build_segment_header_plan(result, 10, 10.0, 15)
+        self.assertEqual(header_plan["split_times_seconds"], [])
         with self.assertRaises(MODULE.ScriptError):
             MODULE.build_segment_plan(result, 10, 10.0, 15)
 

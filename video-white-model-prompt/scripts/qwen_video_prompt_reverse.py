@@ -46,6 +46,7 @@ from typing import Any
 
 from media_preflight import (
     API_MAX_DATA_URL_BYTES,
+    CompressionSignature,
     DEFAULT_INLINE_LIMIT_MB,
     MediaPreflightError,
     build_compression_command as build_compression_command_shared,
@@ -93,6 +94,10 @@ SUPPORTED_VIDEO_MIME_TYPES = {
 
 class ScriptError(RuntimeError):
     """可直接展示给使用者的脚本错误。"""
+
+
+class AudioFactError(ScriptError):
+    """Omni 没有给出可锁定的音频事实声明。"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,6 +181,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--product-name", default="", help="可选产品名称。")
     parser.add_argument("--selling-points", default="", help="可选产品卖点。")
     parser.add_argument("--user-idea", default="", help="可选创意想法，最多 200 字。")
+    parser.add_argument(
+        "--allow-audio-rewrite",
+        action="store_true",
+        help="仅在用户明确要求改写口播时启用。",
+    )
+    parser.add_argument(
+        "--spoken-replacement",
+        action="append",
+        default=[],
+        metavar="旧词=新词",
+        help="用户明确指定的口播词语替换，可重复传入。",
+    )
     parser.add_argument(
         "--transcript-file",
         type=Path,
@@ -282,6 +299,26 @@ def load_api_key(path: Path) -> str:
     return match.group(0)
 
 
+def parse_spoken_replacements(values: list[str]) -> list[tuple[str, str]]:
+    replacements: list[tuple[str, str]] = []
+    seen_sources: set[str] = set()
+    for value in values:
+        if "=" not in value:
+            raise ScriptError(
+                "--spoken-replacement 必须使用 旧词=新词 格式。"
+            )
+        source, target = (part.strip() for part in value.split("=", 1))
+        if not source or not target:
+            raise ScriptError("--spoken-replacement 的旧词和新词都不能为空。")
+        if any(character in source + target for character in "{}\r\n"):
+            raise ScriptError("--spoken-replacement 不能包含大括号或换行。")
+        if source in seen_sources:
+            raise ScriptError(f"--spoken-replacement 重复指定旧词：{source}")
+        seen_sources.add(source)
+        replacements.append((source, target))
+    return replacements
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if not args.model.strip() or not args.omni_model.strip():
         raise ScriptError("--model 和 --omni-model 不能为空。")
@@ -312,6 +349,11 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not args.draft_file and args.draft_metadata_file:
         raise ScriptError("--draft-metadata-file 必须与 --draft-file 一起使用。")
+    replacements = parse_spoken_replacements(args.spoken_replacement)
+    if args.allow_audio_rewrite and replacements:
+        raise ScriptError(
+            "--allow-audio-rewrite 与 --spoken-replacement 不能同时使用。"
+        )
 
 
 def probe_video(video_path: Path) -> dict[str, Any]:
@@ -382,7 +424,7 @@ def validate_video_api_limits(path: Path, metadata: dict[str, Any]) -> None:
     duration = float(metadata["source_duration"])
     if duration < MIN_SEGMENT_SECONDS:
         raise ScriptError(
-            f"Seedance 2.5 成片要求参考视频至少 {MIN_SEGMENT_SECONDS} 秒。"
+            f"Seedance 成片要求参考视频至少 {MIN_SEGMENT_SECONDS} 秒。"
         )
     if metadata["has_audio"] and duration > 3600:
         raise ScriptError("含音轨视频超过 Qwen3.5-Omni-Plus 的 1 小时时长上限。")
@@ -423,7 +465,7 @@ def file_to_data_url(path: Path, media_prefix: str) -> str:
 
 def build_compression_command(path: Path) -> str:
     metadata = probe_video(path)
-    signature = {
+    signature: CompressionSignature = {
         "duration": metadata["source_duration"],
         "has_audio": metadata["has_audio"],
     }
@@ -522,6 +564,22 @@ def context_lines(
             "各段内部镜头均从镜头1[00:00-...]重新编号计时。"
         )
 
+    target_generator = (
+        "Doubao Seedance 2.0"
+        if args.segment_max_seconds == 15
+        else "Doubao Seedance 2.5"
+    )
+    spoken_replacements = parse_spoken_replacements(args.spoken_replacement)
+    if args.allow_audio_rewrite:
+        audio_rewrite_permission = "用户已明确允许改写口播。"
+    elif spoken_replacements:
+        mappings = "；".join(
+            f"{source}→{target}" for source, target in spoken_replacements
+        )
+        audio_rewrite_permission = f"仅允许以下指定词替换：{mappings}。"
+    else:
+        audio_rewrite_permission = "未授权改写；逐段保持 Omni 台词原文。"
+
     return [
         "reference_video：本消息中的视频，仅用于提示词推理。",
         f"character_image：{'已按图片编号提供' if args.character_image else '未提供'}。",
@@ -542,7 +600,8 @@ def context_lines(
         f"segment_max_seconds：{args.segment_max_seconds}",
         f"required_segment_count：{segment_count}",
         f"segment_output_contract：{segment_contract}",
-        "target_generator：Doubao Seedance 2.5",
+        f"target_generator：{target_generator}",
+        f"audio_rewrite_permission：{audio_rewrite_permission}",
     ]
 
 
@@ -600,6 +659,8 @@ def build_refine_user_text(
     aspect_ratio: str,
     duration_seconds: int,
     draft: str,
+    draft_plan: dict[str, Any] | None = None,
+    draft_structure_error: str = "",
 ) -> str:
     lines = [
         "请结合本消息中的参考视频画面、图片参考和下方视听初稿，"
@@ -608,16 +669,34 @@ def build_refine_user_text(
         "audio_visual_draft：以下初稿由可理解音频的全模态模型生成；"
         "其中的音频内容按系统提示词中的事实权限处理。",
     ]
-    if not (
-        args.product_name.strip()
-        or args.selling_points.strip()
-        or args.user_idea.strip()
-    ):
+    if draft_structure_error:
+        if draft_plan is None:
+            raise ScriptError("内部错误：结构修复交接缺少已锁定的分段计划。")
         lines.extend(
             [
-                spoken_content_contract(draft),
-                "最终稿可以在镜头间重新拆分或合并这些台词，但所有 {} 内文本"
-                "按出现顺序拼接后必须与上述清单逐字一致。",
+                "draft_structure_repair：Omni 已确定合法分段计划和音频事实，"
+                "但初稿内部结构未通过机器校验。请在输出最终稿时完成结构修复，"
+                "不得移动下方锁定分段点。",
+                f"draft_structure_error：{draft_structure_error}",
+                locked_segment_plan_contract(draft_plan),
+            ]
+        )
+    elif draft_plan is not None:
+        lines.append(locked_shot_timeline_contract(draft))
+    spoken_replacements = parse_spoken_replacements(args.spoken_replacement)
+    if not args.allow_audio_rewrite:
+        validate_spoken_replacement_sources(draft, spoken_replacements)
+        spoken_rule = (
+            "最终稿只执行上述指定词替换；除此之外，所有 {} 内文本按出现顺序"
+            "拼接后必须与初稿逐字一致。"
+            if spoken_replacements
+            else "最终稿可以在镜头间重新拆分或合并这些台词，但所有 {} 内文本"
+            "按出现顺序拼接后必须与上述清单逐字一致。"
+        )
+        lines.extend(
+            [
+                spoken_content_contract(draft, spoken_replacements),
+                spoken_rule,
             ]
         )
     lines.extend(
@@ -728,7 +807,7 @@ def draft_input_metadata(
     aspect_ratio: str,
     duration_seconds: int,
 ) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "schema_version": 1,
         "source_video": file_identity(video_path),
         "character_image": file_identity(character_image),
@@ -742,6 +821,11 @@ def draft_input_metadata(
         "segment_max_seconds": args.segment_max_seconds,
         "omni_model": args.omni_model,
     }
+    if args.allow_audio_rewrite:
+        body["allow_audio_rewrite"] = True
+    if args.spoken_replacement:
+        body["spoken_replacements"] = list(args.spoken_replacement)
+    return body
 
 
 def load_and_validate_draft_metadata(
@@ -817,7 +901,7 @@ def validate_shot_timeline(section: str, duration: float, label: str) -> None:
         )
 
 
-def build_segment_plan(
+def build_segment_header_plan(
     result: str,
     prompt_duration_seconds: int,
     source_duration_seconds: float,
@@ -825,7 +909,7 @@ def build_segment_plan(
 ) -> dict[str, Any]:
     if prompt_duration_seconds < MIN_SEGMENT_SECONDS:
         raise ScriptError(
-            f"Seedance 2.5 目标时长不能少于 {MIN_SEGMENT_SECONDS} 秒："
+            f"Seedance 目标时长不能少于 {MIN_SEGMENT_SECONDS} 秒："
             f"{prompt_duration_seconds}"
         )
     expected_segment_count = math.ceil(prompt_duration_seconds / segment_max_seconds)
@@ -835,11 +919,10 @@ def build_segment_plan(
         if expected_segment_count > 1:
             raise ScriptError("Qwen 返回内容未包含可解析的分段标题，无法驱动白模切分。")
         durations = [float(prompt_duration_seconds)]
-        validate_shot_timeline(result, durations[0], "单段提示词")
     else:
         if len(header_matches) != expected_segment_count:
             raise ScriptError(
-                "Qwen 返回的分段数量不是 Seedance 2.5 约束下的最少段数："
+                "Qwen 返回的分段数量不是 Seedance 约束下的最少段数："
                 f"{len(header_matches)} != {expected_segment_count}"
             )
         if result[: header_matches[0].start()].strip():
@@ -858,16 +941,6 @@ def build_segment_plan(
                 raise ScriptError(
                     f"第{index}段参考视频终点错误：{source_end:g} != {expected_end:g}"
                 )
-            section_end = (
-                header_matches[index].start()
-                if index < len(header_matches)
-                else len(result)
-            )
-            validate_shot_timeline(
-                result[match.end() : section_end],
-                duration,
-                f"第{index}段提示词",
-            )
             durations.append(duration)
             source_cursor = expected_end
 
@@ -880,7 +953,7 @@ def build_segment_plan(
             f"{MIN_SEGMENT_SECONDS} 到 {segment_max_seconds} 秒之间：{durations}"
         )
     if any(abs(value - round(value)) > TIME_TOLERANCE for value in durations):
-        raise ScriptError(f"Seedance 2.5 分段时长必须为整数秒：{durations}")
+        raise ScriptError(f"Seedance 分段时长必须为整数秒：{durations}")
     if abs(sum(durations) - prompt_duration_seconds) > 0.01:
         raise ScriptError(
             "Qwen 返回的分段时长总和与目标时长不一致："
@@ -924,6 +997,48 @@ def build_segment_plan(
     }
 
 
+def validate_segment_shot_timelines(
+    result: str,
+    plan: dict[str, Any],
+) -> None:
+    header_matches = list(SEGMENT_HEADER_PATTERN.finditer(result))
+    segments = list(plan["segments"])
+    if not header_matches:
+        validate_shot_timeline(
+            result,
+            float(segments[0]["duration_seconds"]),
+            "单段提示词",
+        )
+        return
+    for index, match in enumerate(header_matches, start=1):
+        section_end = (
+            header_matches[index].start()
+            if index < len(header_matches)
+            else len(result)
+        )
+        validate_shot_timeline(
+            result[match.end() : section_end],
+            float(segments[index - 1]["duration_seconds"]),
+            f"第{index}段提示词",
+        )
+
+
+def build_segment_plan(
+    result: str,
+    prompt_duration_seconds: int,
+    source_duration_seconds: float,
+    segment_max_seconds: int,
+) -> dict[str, Any]:
+    plan = build_segment_header_plan(
+        result,
+        prompt_duration_seconds,
+        source_duration_seconds,
+        segment_max_seconds,
+    )
+    validate_segment_shot_timelines(result, plan)
+    return plan
+
+
 def require_same_split_times(
     draft_plan: dict[str, Any], final_plan: dict[str, Any]
 ) -> None:
@@ -942,10 +1057,14 @@ def require_same_split_times(
 IMAGE_REFERENCE_PATTERN = re.compile(r"@图片(?P<number>\d+)")
 BARE_IMAGE_REFERENCE_PATTERN = re.compile(r"(?<!@)图片(?P<number>\d+)")
 SPOKEN_CONTENT_PATTERN = re.compile(r"\{(?P<content>[^{}]*)\}")
+NO_SPEECH_MARKER = "[[NO_SPEECH_CONFIRMED]]"
 API_CONTROL_LITERAL_PATTERN = re.compile(
     r"(?<!\d)(?:21:9|16:9|9:16|4:3|3:4|1:1)(?!\d)"
     r"|(?<![A-Za-z0-9])(?:480p|720p|1080p|2k|4k|8k)(?![A-Za-z0-9])",
     re.IGNORECASE,
+)
+DEFINITION_LINE_PATTERN = re.compile(
+    r"^(?:参考@图片\d+中的.+，将其定义为<[^<>]+>|将.+定义为<[^<>]+>)[。.]?$"
 )
 
 
@@ -999,18 +1118,136 @@ def validate_no_api_control_literals(result: str, label: str) -> None:
         )
 
 
-def normalized_spoken_content(result: str) -> str:
+def validate_no_segment_overview(result: str, label: str) -> None:
+    for index, section in enumerate(prompt_sections(result), start=1):
+        first_shot = SHOT_PATTERN.search(section)
+        if first_shot is None:
+            continue
+        preamble_lines = [
+            line.strip()
+            for line in section[: first_shot.start()].splitlines()
+            if line.strip()
+        ]
+        invalid_lines = [
+            line
+            for line in preamble_lines
+            if DEFINITION_LINE_PATTERN.fullmatch(line) is None
+        ]
+        if invalid_lines:
+            raise ScriptError(
+                f"{label}第{index}段在镜头1前包含非主体定义内容；"
+                "主体定义后必须直接进入镜头1。"
+            )
+
+
+def validate_omni_audio_fact_coverage(result: str) -> str:
+    has_spoken_content = SPOKEN_CONTENT_PATTERN.search(result) is not None
+    marker_count = result.count(NO_SPEECH_MARKER)
+    if has_spoken_content and marker_count:
+        raise AudioFactError("Omni 初稿同时包含台词和无人声确认标记。")
+    if not has_spoken_content and marker_count != 1:
+        raise AudioFactError(
+            "Omni 初稿没有可锁定台词，也没有唯一的无人声确认标记。"
+        )
+    return result.replace(NO_SPEECH_MARKER, "").strip()
+
+
+def shot_timeline_signature(result: str) -> list[list[tuple[float, float]]]:
+    return [
+        [
+            (
+                parse_timecode(match.group("start")),
+                parse_timecode(match.group("end")),
+            )
+            for match in SHOT_PATTERN.finditer(section)
+        ]
+        for section in prompt_sections(result)
+    ]
+
+
+def locked_shot_timeline_contract(result: str) -> str:
+    clean_result = result.replace(NO_SPEECH_MARKER, "").strip()
+    lines = [
+        "locked_shot_timeline：以下镜头数量、顺序和时间区间已经锁定；"
+        "只精修各镜头内部内容："
+    ]
+    for section_index, section in enumerate(
+        shot_timeline_signature(clean_result), start=1
+    ):
+        intervals = "、".join(
+            f"{start:g}-{end:g}秒" for start, end in section
+        )
+        lines.append(f"第{section_index}段：{intervals}")
+    return "\n".join(lines)
+
+
+def require_same_shot_timeline(draft: str, final: str) -> None:
+    clean_draft = draft.replace(NO_SPEECH_MARKER, "").strip()
+    draft_signature = shot_timeline_signature(clean_draft)
+    final_signature = shot_timeline_signature(final)
+    if len(draft_signature) != len(final_signature):
+        raise ScriptError("Max 最终稿改变了 Omni 初稿的镜头分段数量。")
+    for section_index, (draft_section, final_section) in enumerate(
+        zip(draft_signature, final_signature), start=1
+    ):
+        if len(draft_section) != len(final_section) or any(
+            abs(draft_start - final_start) > TIME_TOLERANCE
+            or abs(draft_end - final_end) > TIME_TOLERANCE
+            for (draft_start, draft_end), (final_start, final_end) in zip(
+                draft_section, final_section
+            )
+        ):
+            raise ScriptError(
+                f"Max 最终稿改变了 Omni 初稿第{section_index}段的镜头顺序或时间区间。"
+            )
+
+
+def apply_spoken_replacements(
+    content: str,
+    replacements: list[tuple[str, str]],
+) -> str:
+    for source, target in replacements:
+        content = content.replace(source, target)
+    return content
+
+
+def validate_spoken_replacement_sources(
+    result: str,
+    replacements: list[tuple[str, str]],
+) -> None:
+    spoken_items = [
+        match.group("content") for match in SPOKEN_CONTENT_PATTERN.finditer(result)
+    ]
+    for source, _ in replacements:
+        if not any(source in item for item in spoken_items):
+            raise ScriptError(
+                f"指定口播替换的旧词未出现在 Omni 台词中：{source}"
+            )
+
+
+def normalized_spoken_content(
+    result: str,
+    replacements: list[tuple[str, str]] | None = None,
+) -> str:
     spoken = "".join(
         match.group("content") for match in SPOKEN_CONTENT_PATTERN.finditer(result)
     )
+    spoken = apply_spoken_replacements(spoken, replacements or [])
     return re.sub(r"[\W_]+", "", spoken, flags=re.UNICODE).casefold()
 
 
-def spoken_content_contract(result: str) -> str:
+def spoken_content_contract(
+    result: str,
+    replacements: list[tuple[str, str]] | None = None,
+) -> str:
+    active_replacements = replacements or []
     sections = prompt_sections(result)
     section_items = [
         [
-            match.group("content").strip()
+            apply_spoken_replacements(
+                match.group("content").strip(),
+                active_replacements,
+            )
             for match in SPOKEN_CONTENT_PATTERN.finditer(section)
         ]
         for section in sections
@@ -1027,9 +1264,32 @@ def spoken_content_contract(result: str) -> str:
     return "\n".join(lines)
 
 
-def require_same_spoken_content(draft: str, final: str) -> None:
+def locked_segment_plan_contract(plan: dict[str, Any]) -> str:
+    lines = [
+        "locked_segment_plan：以下段长、累计切点和参考视频范围已经锁定；"
+        "每段内部镜头必须从 00:00 连续覆盖到该段段尾："
+    ]
+    for segment in plan["segments"]:
+        index = int(segment["index"])
+        duration = float(segment["duration_seconds"])
+        source_start = float(segment["prompt_start_seconds"])
+        source_end = float(segment["prompt_end_seconds"])
+        lines.append(
+            f"第{index}段：{duration:g}秒，对齐参考视频"
+            f"{source_start:g}-{source_end:g}秒。"
+        )
+    return "\n".join(lines)
+
+
+def require_same_spoken_content(
+    draft: str,
+    final: str,
+    replacements: list[tuple[str, str]] | None = None,
+) -> None:
+    active_replacements = replacements or []
     draft_sections = [
-        normalized_spoken_content(section) for section in prompt_sections(draft)
+        normalized_spoken_content(section, active_replacements)
+        for section in prompt_sections(draft)
     ]
     final_sections = [
         normalized_spoken_content(section) for section in prompt_sections(final)
@@ -1082,9 +1342,39 @@ def validate_prompt_contract(
     )
     validate_image_reference_contract(result, expected_image_count, label)
     validate_no_api_control_literals(result, label)
+    validate_no_segment_overview(result, label)
     if locked_plan is not None:
         require_same_split_times(locked_plan, plan)
     return plan
+
+
+def validate_omni_draft_for_max(
+    result: str,
+    prompt_duration_seconds: int,
+    source_duration_seconds: float,
+    segment_max_seconds: int,
+    expected_image_count: int,
+    label: str,
+) -> tuple[dict[str, Any], str]:
+    contract_result = validate_omni_audio_fact_coverage(result)
+    try:
+        plan = validate_prompt_contract(
+            contract_result,
+            prompt_duration_seconds,
+            source_duration_seconds,
+            segment_max_seconds,
+            expected_image_count,
+            label,
+        )
+        return plan, ""
+    except ScriptError as structure_error:
+        plan = build_segment_header_plan(
+            contract_result,
+            prompt_duration_seconds,
+            source_duration_seconds,
+            segment_max_seconds,
+        )
+        return plan, str(structure_error)
 
 
 def build_contract_repair_messages(
@@ -1439,11 +1729,8 @@ def main() -> int:
         source_duration_seconds = float(metadata["source_duration"])
         has_audio = metadata["has_audio"]
         expected_image_count = int(character_image is not None) + len(product_images)
-        audio_rewrite_allowed = bool(
-            args.product_name.strip()
-            or args.selling_points.strip()
-            or args.user_idea.strip()
-        )
+        audio_rewrite_allowed = bool(args.allow_audio_rewrite)
+        spoken_replacements = parse_spoken_replacements(args.spoken_replacement)
         print(
             "已读取视频元数据："
             f"画幅 {aspect_ratio}，源时长 {source_duration_seconds:.3f} 秒，"
@@ -1535,6 +1822,7 @@ def main() -> int:
         )
 
         draft_plan: dict[str, Any] | None = None
+        draft_structure_error = ""
         draft = ""
         if reuse_draft_path:
             if reuse_draft_metadata_path is None:
@@ -1546,7 +1834,7 @@ def main() -> int:
             draft = reuse_draft_path.read_text(encoding="utf-8").strip()
             if not draft:
                 raise ScriptError(f"视听提示词初稿内容为空：{reuse_draft_path}")
-            draft_plan = validate_prompt_contract(
+            draft_plan, draft_structure_error = validate_omni_draft_for_max(
                 draft,
                 duration_seconds,
                 source_duration_seconds,
@@ -1554,6 +1842,13 @@ def main() -> int:
                 expected_image_count,
                 "复用的 Omni 初稿",
             )
+            if draft_structure_error:
+                print(
+                    "REUSE_DRAFT structure_delegated_to_max "
+                    f"error={draft_structure_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         media_resolver = MediaResolver(args)
         video_reference = media_resolver.resolve(local_video, "video")
@@ -1578,6 +1873,8 @@ def main() -> int:
                 aspect_ratio,
                 duration_seconds,
                 draft,
+                draft_plan,
+                draft_structure_error,
             )
         elif has_audio:
             omni_addendum = optional_text_file(
@@ -1656,7 +1953,7 @@ def main() -> int:
                 "Qwen3.5-Omni-Plus 初稿",
             )
             try:
-                draft_plan = validate_prompt_contract(
+                draft_plan, draft_structure_error = validate_omni_draft_for_max(
                     draft,
                     duration_seconds,
                     source_duration_seconds,
@@ -1699,13 +1996,20 @@ def main() -> int:
                     True,
                     "Omni 初稿修复候选稿",
                 )
-                draft_plan = validate_prompt_contract(
+                draft_plan, draft_structure_error = validate_omni_draft_for_max(
                     draft,
                     duration_seconds,
                     source_duration_seconds,
                     args.segment_max_seconds,
                     expected_image_count,
                     "Omni 初稿修复稿",
+                )
+            if draft_structure_error:
+                print(
+                    "OMNI_DRAFT structure_delegated_to_max "
+                    f"error={draft_structure_error}",
+                    file=sys.stderr,
+                    flush=True,
                 )
             saved_draft = promote_candidate(
                 draft_candidate_destination,
@@ -1726,6 +2030,8 @@ def main() -> int:
                 aspect_ratio,
                 duration_seconds,
                 draft,
+                draft_plan,
+                draft_structure_error,
             )
         else:
             print("参考视频没有音轨，跳过 Omni 初稿阶段。", file=sys.stderr)
@@ -1794,8 +2100,10 @@ def main() -> int:
                 "Max 终稿",
                 draft_plan,
             )
+            if draft and not draft_structure_error:
+                require_same_shot_timeline(draft, result)
             if draft and not audio_rewrite_allowed:
-                require_same_spoken_content(draft, result)
+                require_same_spoken_content(draft, result, spoken_replacements)
         except ScriptError as validation_error:
             print(
                 "MAX_FINAL contract_repair_start "
@@ -1811,7 +2119,7 @@ def main() -> int:
                     str(validation_error),
                     "Max 最终提示词",
                     (
-                        spoken_content_contract(draft)
+                        spoken_content_contract(draft, spoken_replacements)
                         if draft and not audio_rewrite_allowed
                         else ""
                     ),
@@ -1844,8 +2152,10 @@ def main() -> int:
                 "Max 终稿修复稿",
                 draft_plan,
             )
+            if draft and not draft_structure_error:
+                require_same_shot_timeline(draft, result)
             if draft and not audio_rewrite_allowed:
-                require_same_spoken_content(draft, result)
+                require_same_spoken_content(draft, result, spoken_replacements)
         if args.segment_plan_output:
             segment_plan_path = write_json_output(
                 args.segment_plan_output,

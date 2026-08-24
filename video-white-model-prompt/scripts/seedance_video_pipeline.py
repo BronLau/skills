@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and submit Seedance 2.5 generation tasks from verified prompt segments."""
+"""Prepare and submit Seedance 2.0 or 2.5 tasks from verified prompt segments."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable
 from urllib.parse import quote
+from urllib.parse import urlparse
 
 from media_preflight import (
     MediaPreflightError,
@@ -32,7 +33,14 @@ from media_preflight import (
 from qwen_video_prompt_reverse import SEGMENT_HEADER_PATTERN
 
 
-MODEL_ID = "doubao-seedance-2-5-260628"
+MODEL_BY_SEGMENT_MAX_SECONDS = {
+    15: "doubao-seedance-2-0-260128",
+    30: "doubao-seedance-2-5-260628",
+}
+MODEL_DURATION_RANGE_BY_SEGMENT_MAX_SECONDS = {
+    15: (4, 15),
+    30: (4, 30),
+}
 DEFAULT_RESOLUTION = "720p"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 MIN_GENERATION_SECONDS = 4
@@ -60,9 +68,32 @@ class SeedanceError(RuntimeError):
     pass
 
 
+def configure_network_environment() -> None:
+    removed: list[str] = []
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        value = os.environ.get(name, "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError:
+            continue
+        if parsed.hostname in {"127.0.0.1", "localhost"} and port == 7890:
+            os.environ.pop(name, None)
+            removed.append(name)
+    if removed:
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+        print(
+            "SEEDANCE proxy_bypass variables=" + ",".join(sorted(removed)),
+            flush=True,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="准备或提交 Doubao Seedance 2.5 分段视频生成任务。"
+        description="按分段上限准备或提交 Doubao Seedance 2.0/2.5 视频任务。"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -349,7 +380,10 @@ def validate_segment_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
         prompt_duration = int(plan["prompt_duration_seconds"])
     except (KeyError, TypeError, ValueError) as exc:
         raise SeedanceError("segment_plan.json 缺少有效的分段信息。") from exc
-    if maximum not in (15, 30) or prompt_duration < MIN_GENERATION_SECONDS:
+    if maximum not in MODEL_BY_SEGMENT_MAX_SECONDS:
+        raise SeedanceError("segment_plan.json 不符合 Seedance 时长约束。")
+    minimum, model_maximum = MODEL_DURATION_RANGE_BY_SEGMENT_MAX_SECONDS[maximum]
+    if prompt_duration < minimum:
         raise SeedanceError("segment_plan.json 不符合 Seedance 时长约束。")
     expected_count = math.ceil(prompt_duration / maximum)
     if len(segments) != expected_count:
@@ -365,14 +399,25 @@ def validate_segment_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
             raise SeedanceError(f"第 {expected_index} 段信息无效。") from exc
         if index != expected_index:
             raise SeedanceError("segment_plan.json 的分段编号不连续。")
-        if not MIN_GENERATION_SECONDS <= duration <= maximum:
-            raise SeedanceError(f"第 {index} 段时长不在 4 到 {maximum} 秒之间。")
+        if not minimum <= duration <= model_maximum:
+            raise SeedanceError(
+                f"第 {index} 段时长不在 {minimum} 到 {model_maximum} 秒之间。"
+            )
         if abs(duration - round(duration)) > 0.02:
             raise SeedanceError(f"第 {index} 段时长不是整数秒：{duration}")
         total += int(round(duration))
     if total != prompt_duration:
         raise SeedanceError(f"分段时长总和不匹配：{total} != {prompt_duration}")
     return segments
+
+
+def model_for_segment_max_seconds(maximum: int) -> str:
+    try:
+        return MODEL_BY_SEGMENT_MAX_SECONDS[maximum]
+    except KeyError as exc:
+        raise SeedanceError(
+            f"不支持的最大分段时长：{maximum}；只能为 15 或 30 秒。"
+        ) from exc
 
 
 def split_prompt(prompt: str, segments: list[dict[str, Any]]) -> list[str]:
@@ -468,6 +513,8 @@ def prepare(args: argparse.Namespace) -> Path:
 
     segment_plan = load_json(plan_path, "分段计划")
     segments = validate_segment_plan(segment_plan)
+    segment_max_seconds = int(segment_plan["segment_max_seconds"])
+    model_id = model_for_segment_max_seconds(segment_max_seconds)
     prompt_bodies = split_prompt(prompt_path.read_text(encoding="utf-8"), segments)
     depth_files: list[Path] = []
     if args.depth_dir:
@@ -502,7 +549,7 @@ def prepare(args: argparse.Namespace) -> Path:
         for index, image in enumerate(images, start=1)
     ]
     prepared_segments: list[dict[str, Any]] = []
-    for segment, body in zip(segments, prompt_bodies):
+    for segment, prompt_body in zip(segments, prompt_bodies):
         index = int(segment["index"])
         depth_identity = None
         if depth_files:
@@ -510,7 +557,7 @@ def prepare(args: argparse.Namespace) -> Path:
                 depth_files[index - 1], assets_dir / f"depth_part_{index:02d}.mp4"
             )
             depth_identity = file_identity(normalized)
-        compiled = compile_prompt(body, len(images), bool(depth_files))
+        compiled = compile_prompt(prompt_body, len(images), bool(depth_files))
         prompt_file = prompts_dir / f"part_{index:02d}.txt"
         prompt_file.write_text(compiled.rstrip() + "\n", encoding="utf-8")
         prepared_segments.append(
@@ -525,11 +572,12 @@ def prepare(args: argparse.Namespace) -> Path:
             }
         )
 
-    body = {
+    plan_body = {
         "schema_version": 1,
         "status": "prepared",
         "run_id": uuid.uuid4().hex,
-        "model": MODEL_ID,
+        "model": model_id,
+        "segment_max_seconds": segment_max_seconds,
         "mode": "depth-reference" if depth_files else "text-and-image-reference",
         "source_video": file_identity(source_video),
         "prompt": file_identity(prompt_path),
@@ -546,7 +594,7 @@ def prepare(args: argparse.Namespace) -> Path:
         "full_output_file": str(generated_dir / f"full.{args.output_format}"),
         "segments": prepared_segments,
     }
-    atomic_write_json(plan_output, body)
+    atomic_write_json(plan_output, plan_body)
     print(f"SEEDANCE prepared plan={plan_output} tasks={len(prepared_segments)}")
     return plan_output
 
@@ -685,8 +733,11 @@ class TosPublisher:
         self.config = config
         self.public_domain = config.get("public_domain", "").rstrip("/")
         self.signed_url_ttl = signed_url_ttl
+        self._client: Any | None = None
 
     def client(self) -> Any:
+        if self._client is not None:
+            return self._client
         access_key = self.config["access_key"]
         secret_key = self.config["secret_key"]
         security_token = self.config.get("security_token") or None
@@ -702,13 +753,16 @@ class TosPublisher:
             sts = StsService()
             sts.set_ak(access_key)
             sts.set_sk(secret_key)
-            assumed = sts.assume_role(
-                {
-                    "DurationSeconds": "900",
-                    "RoleSessionName": "video-white-model-prompt",
-                    "RoleTrn": role_trn,
-                }
-            )
+            try:
+                assumed = sts.assume_role(
+                    {
+                        "DurationSeconds": "900",
+                        "RoleSessionName": "video-white-model-prompt",
+                        "RoleTrn": role_trn,
+                    }
+                )
+            except Exception as exc:
+                raise SeedanceError(f"STS AssumeRole 失败：{exc}") from exc
             try:
                 credentials = assumed["Result"]["Credentials"]
                 access_key = credentials["AccessKeyId"]
@@ -716,13 +770,17 @@ class TosPublisher:
                 security_token = credentials["SessionToken"]
             except (KeyError, TypeError) as exc:
                 raise SeedanceError("STS AssumeRole 响应中缺少临时凭证。") from exc
-        return self.tos.TosClientV2(
-            ak=access_key,
-            sk=secret_key,
-            endpoint=self.config["endpoint"],
-            region=self.config["region"],
-            security_token=security_token,
-        )
+        try:
+            self._client = self.tos.TosClientV2(
+                ak=access_key,
+                sk=secret_key,
+                endpoint=self.config["endpoint"],
+                region=self.config["region"],
+                security_token=security_token,
+            )
+        except Exception as exc:
+            raise SeedanceError(f"火山 TOS 客户端初始化失败：{exc}") from exc
+        return self._client
 
     def upload(self, path: Path, run_id: str, asset_id: str) -> dict[str, Any]:
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name)
@@ -730,12 +788,15 @@ class TosPublisher:
             f"{self.prefix}/{run_id}/{asset_id}_{file_sha256(path)[:16]}_{safe_name}"
         )
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        self.client().put_object_from_file(
-            self.bucket,
-            object_key,
-            str(path),
-            content_type=content_type,
-        )
+        try:
+            self.client().put_object_from_file(
+                self.bucket,
+                object_key,
+                str(path),
+                content_type=content_type,
+            )
+        except Exception as exc:
+            raise SeedanceError(f"火山 TOS 素材上传失败：{path.name}：{exc}") from exc
         return self.sign(object_key)
 
     def sign(self, object_key: str) -> dict[str, Any]:
@@ -750,12 +811,15 @@ class TosPublisher:
                 "STS 临时凭证模式需要配置 publicDomain，"
                 "避免签名 URL 超过临时凭证有效期。"
             )
-        result = self.client().pre_signed_url(
-            self.tos.HttpMethodType.Http_Method_Get,
-            self.bucket,
-            object_key,
-            expires=self.signed_url_ttl,
-        )
+        try:
+            result = self.client().pre_signed_url(
+                self.tos.HttpMethodType.Http_Method_Get,
+                self.bucket,
+                object_key,
+                expires=self.signed_url_ttl,
+            )
+        except Exception as exc:
+            raise SeedanceError(f"火山 TOS 签名 URL 生成失败：{exc}") from exc
         return {
             "object_key": object_key,
             "url": result.signed_url,
@@ -1070,11 +1134,23 @@ def submit(
 ) -> Path:
     plan_path = require_file(args.plan, "Seedance 计划")
     plan = load_json(plan_path, "Seedance 计划")
-    if plan.get("status") != "prepared" or plan.get("model") != MODEL_ID:
-        raise SeedanceError("Seedance 计划状态或模型无效。")
+    if plan.get("status") != "prepared":
+        raise SeedanceError("Seedance 计划状态无效。")
     validate_identity(plan["source_video"], "原始参考视频")
     validate_identity(plan["prompt"], "最终提示词")
-    validate_identity(plan["segment_plan"], "分段计划")
+    segment_plan_path = validate_identity(plan["segment_plan"], "分段计划")
+    segment_plan = load_json(segment_plan_path, "分段计划")
+    validate_segment_plan(segment_plan)
+    segment_max_seconds = int(segment_plan["segment_max_seconds"])
+    expected_model = model_for_segment_max_seconds(segment_max_seconds)
+    if plan.get("model") != expected_model:
+        raise SeedanceError(
+            "Seedance 计划模型与最大分段时长不匹配："
+            f"{segment_max_seconds}s 必须使用 {expected_model}。"
+        )
+    recorded_maximum = plan.get("segment_max_seconds")
+    if recorded_maximum is not None and int(recorded_maximum) != segment_max_seconds:
+        raise SeedanceError("Seedance 计划记录的最大分段时长与分段计划不一致。")
     for asset in plan.get("images") or []:
         validate_identity(asset["identity"], f"{asset['id']} 图片")
     for segment in plan["segments"]:
@@ -1184,7 +1260,7 @@ def submit(
         if previous_status in {"create_failed", "failed", "cancelled", "expired"}:
             if not args.retry_failed:
                 raise SeedanceError(
-                    f"第 {index} 段上次状态为 {previous_status}，不会自动重新计费。"
+                    f"第 {index} 段上次状态为 {previous_status}，不会自动创建新任务。"
                 )
             segment_state.clear()
         if previous_status == "create_ambiguous":
@@ -1397,6 +1473,7 @@ def main() -> int:
         if args.command == "prepare":
             prepare(args)
         else:
+            configure_network_environment()
             if args.poll_interval < 0 or args.poll_timeout <= 0:
                 raise SeedanceError("轮询间隔不能为负数，超时时间必须为正数。")
             if not 3600 <= args.signed_url_ttl <= 7 * 24 * 3600:

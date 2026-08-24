@@ -11,6 +11,7 @@ import sys
 import time
 from fractions import Fraction
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
@@ -123,9 +124,12 @@ def file_identity(path: Path) -> dict[str, str | int]:
 
 def preprocess(frame: np.ndarray) -> np.ndarray:
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    image = cv2.resize(image, MODEL_SIZE, interpolation=cv2.INTER_CUBIC)
-    image = (image - IMAGENET_MEAN) / IMAGENET_STD
-    return image.transpose(2, 0, 1)[None].astype(np.float32)
+    resized = np.asarray(
+        cv2.resize(image, MODEL_SIZE, interpolation=cv2.INTER_CUBIC),
+        dtype=np.float32,
+    )
+    normalized = (resized - IMAGENET_MEAN) / IMAGENET_STD
+    return normalized.transpose(2, 0, 1)[None].astype(np.float32)
 
 
 def infer_all(
@@ -482,7 +486,7 @@ def encode(
                     backward_flow = cv2.calcOpticalFlowFarneback(
                         gray,
                         prev_gray,
-                        None,
+                        cast(np.ndarray, None),
                         0.5,
                         3,
                         15,

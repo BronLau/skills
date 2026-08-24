@@ -129,6 +129,10 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertNotIn("【参考素材职责】", compiled)
             self.assertTrue(body["parameters"]["generate_audio"])
             self.assertEqual(body["parameters"]["resolution"], "720p")
+            self.assertEqual(body["segment_max_seconds"], 15)
+            self.assertEqual(
+                body["model"], MODULE.MODEL_BY_SEGMENT_MAX_SECONDS[15]
+            )
 
     def test_prepare_with_depth_adds_only_generated_white_model_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -167,6 +171,10 @@ class SeedancePipelineTests(unittest.TestCase):
 
     def test_default_seedance_resolution_is_720p(self) -> None:
         self.assertEqual(MODULE.DEFAULT_RESOLUTION, "720p")
+        self.assertEqual(
+            MODULE.MODEL_DURATION_RANGE_BY_SEGMENT_MAX_SECONDS,
+            {15: (4, 15), 30: (4, 30)},
+        )
 
     def test_prepare_splits_multi_segment_prompt_into_minimum_task_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +213,10 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertEqual(
                 [segment["duration_seconds"] for segment in body["segments"]],
                 [27, 4],
+            )
+            self.assertEqual(body["segment_max_seconds"], 30)
+            self.assertEqual(
+                body["model"], MODULE.MODEL_BY_SEGMENT_MAX_SECONDS[30]
             )
             self.assertIn(
                 "第一段",
@@ -274,6 +286,9 @@ class SeedancePipelineTests(unittest.TestCase):
 
                 def assume_role(self, params: dict[str, str]) -> dict[str, object]:
                     captured["role"] = params["RoleTrn"]
+                    captured["assume_count"] = int(
+                        captured.get("assume_count", 0)
+                    ) + 1
                     return {
                         "Result": {
                             "Credentials": {
@@ -316,15 +331,58 @@ class SeedancePipelineTests(unittest.TestCase):
             ):
                 publisher = MODULE.TosPublisher(config, 3600)
                 uploaded = publisher.upload(path, "run-id", "image-01")
+                publisher.upload(path, "run-id", "image-02")
 
             self.assertEqual(captured["role"], config["role_trn"])
             self.assertEqual(captured["client"]["security_token"], "temp-token")
+            self.assertEqual(captured["assume_count"], 1)
             self.assertTrue(
                 str(uploaded["url"]).startswith(
                     "https://tos.example.com/authorized/prod/"
                 )
             )
             self.assertNotIn(" ", str(uploaded["url"]))
+
+    def test_local_proxy_is_bypassed_for_seedance_network_calls(self) -> None:
+        proxy_environment = {
+            "HTTP_PROXY": "http://127.0.0.1:7890",
+            "HTTPS_PROXY": "http://localhost:7890",
+        }
+        with mock.patch.dict(os.environ, proxy_environment, clear=False):
+            MODULE.configure_network_environment()
+            self.assertNotIn("HTTP_PROXY", os.environ)
+            self.assertNotIn("HTTPS_PROXY", os.environ)
+            self.assertEqual(os.environ["NO_PROXY"], "*")
+            self.assertEqual(os.environ["no_proxy"], "*")
+
+    def test_sts_network_error_is_wrapped_as_seedance_error(self) -> None:
+        class FailingSts:
+            def set_ak(self, _: str) -> None:
+                return
+
+            def set_sk(self, _: str) -> None:
+                return
+
+            def assume_role(self, _: dict[str, str]) -> dict[str, object]:
+                raise TimeoutError("proxy timeout")
+
+        config = {
+            "access_key": "base-ak",
+            "secret_key": "base-sk",
+            "endpoint": "tos-cn-beijing.volces.com",
+            "region": "cn-beijing",
+            "bucket": "bucket",
+            "role_trn": "trn:iam::1:role/tos-put",
+            "prefix": "authorized/prod/video-white-model-prompt",
+            "public_domain": "https://tos.example.com",
+        }
+        with mock.patch(
+            "volcengine.sts.StsService.StsService",
+            return_value=FailingSts(),
+        ):
+            publisher = MODULE.TosPublisher(config, 3600)
+            with self.assertRaisesRegex(MODULE.SeedanceError, "AssumeRole 失败"):
+                publisher.client()
 
     def test_create_task_passes_new_seedance_fields_through_extra_body(self) -> None:
         captured: dict[str, object] = {}
@@ -338,7 +396,7 @@ class SeedancePipelineTests(unittest.TestCase):
             content_generation=SimpleNamespace(tasks=RecordingTasks())
         )
         request = {
-            "model": MODULE.MODEL_ID,
+            "model": MODULE.MODEL_BY_SEGMENT_MAX_SECONDS[15],
             "content": [{"type": "text", "text": "生成一段全新视频。"}],
             "generate_audio": False,
             "ratio": "9:16",
@@ -360,6 +418,34 @@ class SeedancePipelineTests(unittest.TestCase):
                 "output_format": "mp4",
             },
         )
+
+    def test_submit_rejects_model_that_does_not_match_segment_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, segment_plan = self.write_single_segment_inputs(root)
+            prompt.write_text("镜头1[00:00-00:10] 展示。\n", encoding="utf-8")
+            prepare_args = self.make_prepare_args(root, source, prompt, segment_plan)
+            with mock.patch.object(
+                MODULE, "probe_video", return_value=self.metadata(has_audio=False)
+            ):
+                plan_path = MODULE.prepare(prepare_args)
+
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["model"] = MODULE.MODEL_BY_SEGMENT_MAX_SECONDS[30]
+            MODULE.atomic_write_json(plan_path, plan)
+            submit_args = SimpleNamespace(
+                plan=plan_path,
+                ark_api_key_file=None,
+                tos_config_file=None,
+                poll_interval=0.0,
+                poll_timeout=5.0,
+                signed_url_ttl=3600,
+                retry_failed=False,
+                allow_recreate_ambiguous=False,
+            )
+
+            with self.assertRaisesRegex(MODULE.SeedanceError, "模型与最大分段时长不匹配"):
+                MODULE.submit(submit_args)
 
     def test_normalizes_incompatible_depth_video_to_seedance_limits(self) -> None:
         ffmpeg = shutil.which("ffmpeg")
@@ -448,7 +534,7 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertAlmostEqual(float(metadata["duration"]), 4, delta=0.2)
             self.assertTrue(metadata["has_audio"])
 
-    def test_submit_resume_does_not_create_duplicate_paid_task(self) -> None:
+    def test_submit_resume_does_not_create_duplicate_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, prompt, plan = self.write_single_segment_inputs(root)

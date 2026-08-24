@@ -22,6 +22,10 @@ from media_preflight import (
     validate_image_input as validate_image_input_shared,
     validate_seedance_image_input as validate_seedance_image_input_shared,
 )
+from qwen_video_prompt_reverse import (
+    ScriptError as QwenScriptError,
+    parse_spoken_replacements,
+)
 
 __all__ = [
     "build_compression_command",
@@ -36,9 +40,7 @@ QWEN_SCRIPT = SKILL_DIR / "scripts" / "qwen_video_prompt_reverse.py"
 SEEDANCE_SCRIPT = SKILL_DIR / "scripts" / "seedance_video_pipeline.py"
 SYSTEM_PROMPT = SKILL_DIR / "prompts" / "video_reverse_system_prompt.txt"
 MODEL_NAME = "depth_anything_v2_vits.onnx"
-LOCAL_MODEL_FALLBACK = Path(
-    "/Users/bron/Documents/CodeX/Video/models/depth_anything_v2_vits.onnx"
-)
+LOCAL_MODEL_FALLBACK = Path("~/Documents/CodeX/Video/models") / MODEL_NAME
 
 
 class PipelineError(RuntimeError):
@@ -69,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--character-image", type=Path)
     parser.add_argument("--selling-points", default="")
     parser.add_argument("--user-idea", default="")
+    parser.add_argument("--allow-audio-rewrite", action="store_true")
+    parser.add_argument("--spoken-replacement", action="append", default=[])
     parser.add_argument("--transcript-file", type=Path)
     parser.add_argument("--api-key-file", type=Path)
     parser.add_argument("--depth-model", type=Path)
@@ -134,6 +138,17 @@ def validate_seedance_image_input(path: Path, label: str) -> None:
         validate_seedance_image_input_shared(path, label)
     except MediaPreflightError as exc:
         raise PipelineError(str(exc)) from exc
+
+
+def validate_spoken_options(args: argparse.Namespace) -> None:
+    try:
+        replacements = parse_spoken_replacements(args.spoken_replacement)
+    except QwenScriptError as exc:
+        raise PipelineError(str(exc)) from exc
+    if args.allow_audio_rewrite and replacements:
+        raise PipelineError(
+            "--allow-audio-rewrite 与 --spoken-replacement 不能同时使用。"
+        )
 
 
 def resolve_key_path(path: Path | None) -> Path | None:
@@ -208,7 +223,7 @@ def run_manifest(
     product_images: list[Path],
     transcript_file: Path | None,
 ) -> dict[str, object]:
-    return {
+    body: dict[str, object] = {
         "schema_version": 2,
         "video": file_identity(video),
         "analysis_video": file_identity(analysis_video),
@@ -232,6 +247,11 @@ def run_manifest(
         if args.scope != "depth-only"
         else None,
     }
+    if args.allow_audio_rewrite:
+        body["allow_audio_rewrite"] = True
+    if args.spoken_replacement:
+        body["spoken_replacements"] = list(args.spoken_replacement)
+    return body
 
 
 def write_manifest(path: Path, body: dict[str, object]) -> None:
@@ -359,6 +379,7 @@ def main() -> int:
     try:
         prompt_mode = args.scope != "depth-only"
         with_depth = args.scope in {"depth-only", "depth-prompt-seedance"}
+        validate_spoken_options(args)
         if args.resume and args.scope == "depth-only":
             raise PipelineError("--resume 仅支持包含 Seedance 成片的模式")
         video = require_file(args.video, "参考视频")
@@ -389,6 +410,8 @@ def main() -> int:
             or character_image
             or args.selling_points.strip()
             or args.user_idea.strip()
+            or args.allow_audio_rewrite
+            or args.spoken_replacement
             or transcript_file
             or args.analysis_video
             or args.api_key_file
@@ -442,8 +465,10 @@ def main() -> int:
         if args.scope == "depth-only":
             if model is None:
                 raise PipelineError("内部错误：仅白模模式缺少深度模型")
-            with tempfile.TemporaryDirectory(prefix="chuangliang-depth-") as work_dir:
-                depth_infer = [
+            with tempfile.TemporaryDirectory(
+                prefix="chuangliang-depth-"
+            ) as depth_temp_dir:
+                depth_only_infer = [
                     sys.executable,
                     str(DEPTH_SCRIPT),
                     "--mode",
@@ -453,9 +478,9 @@ def main() -> int:
                     "--model",
                     str(model),
                     "--work-dir",
-                    work_dir,
+                    depth_temp_dir,
                 ]
-                if run_process(depth_infer) != 0:
+                if run_process(depth_only_infer) != 0:
                     raise PipelineError("白模深度推理失败")
                 depth_encode = [
                     sys.executable,
@@ -465,7 +490,7 @@ def main() -> int:
                     "--input",
                     str(video),
                     "--work-dir",
-                    work_dir,
+                    depth_temp_dir,
                     "--output-dir",
                     str(output_dir / "depth"),
                     "--segment-seconds",
@@ -564,6 +589,10 @@ def main() -> int:
                 qwen_command.extend(["--selling-points", args.selling_points.strip()])
             if args.user_idea.strip():
                 qwen_command.extend(["--user-idea", args.user_idea.strip()])
+            if args.allow_audio_rewrite:
+                qwen_command.append("--allow-audio-rewrite")
+            for replacement in args.spoken_replacement:
+                qwen_command.extend(["--spoken-replacement", replacement])
             if transcript_file:
                 qwen_command.extend(["--transcript-file", str(transcript_file)])
             for image in product_images:

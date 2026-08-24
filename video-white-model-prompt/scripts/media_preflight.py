@@ -9,7 +9,7 @@ import mimetypes
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 
 API_MAX_DATA_URL_BYTES = 10 * 1024 * 1024
@@ -31,13 +31,24 @@ class MediaPreflightError(RuntimeError):
     pass
 
 
+class CompressionSignature(TypedDict):
+    duration: float
+    has_audio: bool
+
+
+class VideoSignature(CompressionSignature):
+    start_time: float
+    width: int
+    height: int
+
+
 def estimated_data_url_size(path: Path, mime_type: str | None = None) -> int:
     prefix_size = len(f"data:{mime_type};base64,") if mime_type else 128
     size = path.stat().st_size
     return prefix_size + 4 * ((size + 2) // 3)
 
 
-def probe_video_signature(path: Path) -> dict[str, object]:
+def probe_video_signature(path: Path) -> VideoSignature:
     command = [
         "ffprobe",
         "-v",
@@ -102,7 +113,7 @@ def probe_video_signature(path: Path) -> dict[str, object]:
 
 def build_compression_command(
     source_video: Path,
-    signature: dict[str, object],
+    signature: CompressionSignature,
 ) -> str:
     duration = float(signature["duration"])
     total_kbps = int(TARGET_COMPRESSED_BYTES * 8 * 0.94 / duration / 1000)

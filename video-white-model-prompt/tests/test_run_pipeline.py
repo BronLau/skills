@@ -61,6 +61,8 @@ class ResumePipelineTests(unittest.TestCase):
             character_image=None,
             selling_points="",
             user_idea="",
+            allow_audio_rewrite=False,
+            spoken_replacement=[],
             transcript_file=None,
             api_key_file=None,
             depth_model=None,
@@ -263,7 +265,7 @@ class ResumePipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PipelineError, "9.5 MiB"):
                 MODULE.validate_image_input(image_path, "产品图", 0.000001)
 
-    def test_seedance_image_preflight_runs_before_paid_or_depth_processes(self) -> None:
+    def test_seedance_image_preflight_runs_before_generation_or_depth_processes(self) -> None:
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -469,11 +471,14 @@ class ResumePipelineTests(unittest.TestCase):
             video.write_bytes(b"video")
             args = self.make_args(root, video)
             args.scope = "prompt-seedance"
+            args.spoken_replacement = ["旧产品=收腹裤"]
             commands: list[list[str]] = []
 
             def fake_popen(command: list[str]):
                 commands.append(command)
                 self.assertIn(str(MODULE.QWEN_SCRIPT), command)
+                replacement_index = command.index("--spoken-replacement")
+                self.assertEqual(command[replacement_index + 1], "旧产品=收腹裤")
 
                 def write_prompt_outputs():
                     self.command_value(command, "--output").write_text(
