@@ -45,6 +45,7 @@ DEFAULT_RESOLUTION = "720p"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 MIN_GENERATION_SECONDS = 4
 MAX_GENERATION_SECONDS = 30
+MAX_SEED = 2**31 - 1
 MIN_REFERENCE_VIDEO_SECONDS = 2
 MAX_REFERENCE_VIDEO_SECONDS = 30
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
@@ -535,9 +536,9 @@ def prepare(args: argparse.Namespace) -> Path:
         generate_audio = bool(source_metadata["has_audio"] or transcript_file)
     else:
         generate_audio = args.generate_audio == "true"
-    seed = args.seed if args.seed is not None else secrets.randbelow(2**32)
-    if not -1 <= seed <= 2**32 - 1:
-        raise SeedanceError("--seed 必须在 -1 到 2^32-1 之间。")
+    seed = args.seed if args.seed is not None else secrets.randbelow(MAX_SEED + 1)
+    if not -1 <= seed <= MAX_SEED:
+        raise SeedanceError(f"--seed 必须在 -1 到 {MAX_SEED} 之间。")
 
     image_assets = [
         {

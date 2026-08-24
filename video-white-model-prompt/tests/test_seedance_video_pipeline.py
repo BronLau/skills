@@ -171,10 +171,46 @@ class SeedancePipelineTests(unittest.TestCase):
 
     def test_default_seedance_resolution_is_720p(self) -> None:
         self.assertEqual(MODULE.DEFAULT_RESOLUTION, "720p")
+        self.assertEqual(MODULE.MAX_SEED, 2147483647)
         self.assertEqual(
             MODULE.MODEL_DURATION_RANGE_BY_SEGMENT_MAX_SECONDS,
             {15: (4, 15), 30: (4, 30)},
         )
+
+    def test_prepare_rejects_seed_above_ark_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.seed = MODULE.MAX_SEED + 1
+
+            with mock.patch.object(
+                MODULE, "probe_video", return_value=self.metadata()
+            ):
+                with self.assertRaisesRegex(MODULE.SeedanceError, "2147483647"):
+                    MODULE.prepare(args)
+
+    def test_prepare_random_seed_stays_within_ark_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "镜头1[00:00-00:10] 户外人物展示。\n", encoding="utf-8"
+            )
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.seed = None
+
+            with (
+                mock.patch.object(MODULE, "probe_video", return_value=self.metadata()),
+                mock.patch.object(
+                    MODULE.secrets, "randbelow", return_value=MODULE.MAX_SEED
+                ) as random_mock,
+            ):
+                plan_path = MODULE.prepare(args)
+
+            random_mock.assert_called_once_with(MODULE.MAX_SEED + 1)
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(body["parameters"]["seed"], MODULE.MAX_SEED)
 
     def test_prepare_splits_multi_segment_prompt_into_minimum_task_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
