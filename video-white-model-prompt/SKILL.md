@@ -1,8 +1,8 @@
 ---
 name: video-white-model-prompt
-description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
+description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；人物图参考支持私域虚拟人像 Asset 或已授权真人 Asset。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
 metadata:
-  version: 1.10.2
+  version: 1.11.1
 ---
 
 # 视频白模、提示词反推与 Seedance 成片
@@ -56,6 +56,8 @@ metadata:
 
 产品名称、卖点和创意默认不改变参考视频台词。只有用户主动提出口播修改时，才展示：`1. 保持原台词`、`2. 只替换指定旧词`、`3. 允许整段改写`。选择 2 后逐项收集 `旧词=新词`；选择 3 时记录明确授权。用户未提及口播修改时自动采用选项 1，不增加询问步骤。
 
+选择人物形象图时，读取 [私域人像资产链路](references/virtual_portrait_assets.md)，并继续单选：`1. 虚拟人像`、`2. 真人肖像`、`3. 无法确认类型`。选择 1 时再提供：`1. 创建新的私域 Asset`、`2. 使用已有 Asset ID`；创建前必须由用户明确确认素材为虚拟形象、合法拥有完整权利、不与自然人肖像雷同且不侵害第三方权益。选择 2 时必须提供已经完成真人授权的 Asset ID，不把真人肖像上传到私域虚拟人像库。选择 3 时停止人像资产步骤并说明两类资产边界。人物类型由用户声明，不通过自动人脸判断替代用户确认。
+
 ### 步骤 5：选择 Qwen Key 来源
 
 仅两种 Seedance 成片模式需要。不要要求用户在聊天中粘贴 Key，提供：
@@ -77,7 +79,7 @@ Seedance 成片模式要求参考视频至少 4 秒。每段必须是 4 到用�
 
 带白模成片时，正式白模仍保持原画幅、CFR、H.264、720p、无音频。若其 FPS、编码、尺寸或宽高比不符合 Seedance 参考视频要求，只在 `seedance/assets/` 生成兼容副本，不修改正式白模。
 
-Seedance 图片在提交前检查大小、像素和宽高比。按用户选择，不增加真人人脸检测、改写或拦截；Ark API 拒绝时原样保留错误并停止。
+Seedance 图片在提交前检查大小、像素和宽高比。人物形象图还必须具有明确的人像类型和 Asset 路由；产品图不进入人像素材库。使用人物 Asset 前确认账号已开通私域素材库能力，AK/SK 具备所需 IAM 权限，且 Asset、Asset Group 与 Ark API Key 属于同一 `ProjectName`。创建新虚拟 Asset 时，先按人物图 SHA-256 稳定名称调用 `ListAssets` 查找可复用素材；该查询也作为上传前的访问预检。Ark API 拒绝时原样保留错误并停止。
 
 深度模型只在 `仅白模` 和 `白模+提示词+Seedance成片` 中解析，顺序为命令参数、`DEPTH_ANYTHING_MODEL`、Skill 本地模型、机器已知模型路径。无白模模式不得要求深度模型。
 
@@ -88,6 +90,7 @@ Seedance 图片在提交前检查大小、像素和宽高比。按用户选择�
 - 分析视频、其中的原始音轨和图片会发送至阿里云 Qwen；有音轨时正常调用 Omni 与 Max 两次，无音轨时只调用 Max 一次。
 - 原始参考视频和原始音轨不会发送至 Seedance。
 - Seedance 每个最终分段对应一个独立生成任务；素材只在第二次确认后上传火山 TOS 和提交 Ark。
+- 虚拟人物图只在第二次确认后上传 TOS、创建或查询私域 Asset，并在状态为 `Active` 后用于 Seedance；真人肖像只查询用户提供的已授权 Asset ID。
 - 当前 TOS 配置通过 `publicDomain` 暴露生成素材 URL，写入角色不能主动删除对象；提交前必须说明公开可读范围和 Bucket 生命周期依赖。
 
 最后提供：`1. 确认并开始第一阶段`、`2. 修改以上信息`、`3. 取消`。用户选择 1 后冻结本次输入。
@@ -113,6 +116,9 @@ python3 <skill-root>/scripts/run_pipeline.py \
   --product-name <可选> \
   --product-image <可重复最多9次> \
   --character-image <可选> \
+  --character-image-type <virtual|real> \
+  --character-asset-id <已有Asset时传入> \
+  --confirm-virtual-portrait-rights \
   --selling-points <可选> \
   --user-idea <可选> \
   --spoken-replacement <用户明确指定的旧词=新词，可重复> \
@@ -141,9 +147,10 @@ Max 正式稿必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 
 第一阶段成功后，再分步收集提交配置，每轮只问一项：
 
 - Ark Key 来源：`1. 使用 ARK_API_KEY 环境变量`、`2. 提供 Key 文件路径`、`3. 暂不提交并保留第一阶段产物`。不要要求用户在聊天中粘贴 Key。
-- 带白模或提供了图片时，火山 TOS 来源：`1. 使用已配置的 TOS 环境变量`、`2. 使用当前机器默认目录 /Users/bron/Documents/CodeX/API/火山`、`3. 提供配置文件或目录路径`、`4. 暂不提交并保留第一阶段产物`。只使用火山 TOS，不接入其他 OSS。
+- 带白模、产品图或需要创建新虚拟 Asset 时，火山 TOS 来源：`1. 使用已配置的 TOS 环境变量`、`2. 使用当前机器默认目录 /Users/bron/Documents/CodeX/API/火山`、`3. 提供配置文件或目录路径`、`4. 暂不提交并保留第一阶段产物`。只使用火山 TOS，不接入其他 OSS。仅查询已有人物 Asset 且没有其他上传素材时，仍从该配置读取 AK/SK 和区域，但不要求 Bucket 或 Endpoint。
+- 使用人物 Asset 时收集 `ProjectName`：`1. default`、`2. 指定其他项目名称`。Asset Group、Asset 和 Ark API Key 必须属于同一项目。
 
-完整展示正式提示词、Seedance 模型、任务数、每段时长、是否带白模、图片数量、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
+完整展示正式提示词、Seedance 模型、任务数、每段时长、是否带白模、图片数量、人物类型、人物 Asset 创建或复用方式、`ProjectName`、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
 
 1. `确认并提交全部分段`
 2. `修改生成参数`
@@ -158,6 +165,9 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --source-video <原片> \
   --depth-dir <带白模时传入> \
   --character-image <按原计划可选> \
+  --character-image-type <virtual|real> \
+  --character-asset-id <按原计划可选> \
+  --confirm-virtual-portrait-rights \
   --product-image <按原计划可重复> \
   --output-dir <输出目录>/seedance \
   --resolution <修改后值> \
@@ -172,12 +182,17 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
 python3 <skill-root>/scripts/seedance_video_pipeline.py submit \
   --plan <输出目录>/seedance/seedance_plan.json \
   --ark-api-key-file <可选Ark Key文件> \
-  --tos-config-file <有素材时的火山TOS配置文件或目录>
+  --tos-config-file <有素材时的火山TOS配置文件或目录> \
+  --asset-project-name <人物Asset所在项目，默认default>
 ```
 
-TOS 配置支持两种格式：JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段；或本机 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`。传目录时默认读取其中的 `Volc engine_API_KEY.md`。配置文件包含密钥，不作为交付物展示。
+只有用户针对人物 Asset 再次明确确认后，才追加 `--retry-failed-character-asset` 或 `--allow-recreate-ambiguous-character-asset`。这两个参数不由视频任务的 `--retry-failed` 或 `--allow-recreate-ambiguous` 代替。
+
+火山配置支持两种格式：JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段；或本机 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`。传目录时默认读取其中的 `Volc engine_API_KEY.md`。创建或上传素材需要完整 TOS 字段；只查询已有人物 Asset 时只要求 AK/SK 和区域。配置文件包含密钥，不作为交付物展示。
 
 配置存在 `roleTrn` 时先通过 STS AssumeRole 获取临时写入凭证，所有对象必须写入 `mainPath/video-white-model-prompt/` 授权前缀；存在 `publicDomain` 时优先使用经过 URL 编码的公开 TOS 链接提交 Seedance，否则使用签名 URL。无白模且无图片时直接文生视频，不要求 TOS。原片和原始音轨在任何模式下都不上传 Seedance；声音仅由正式提示词和 `generate_audio` 控制。
+
+虚拟人物图没有已有 Asset ID 时，提交阶段先用图片 SHA-256 派生的稳定名称调用 `ListAssets`。命中 `Active` 或 `Processing` 素材时校验远端图片与本地人物图一致并复用，不上传原图；没有命中时才上传该图获取可访问 URL，再依次调用 `CreateAssetGroup`、`CreateAsset` 和 `GetAsset`。只有 `Status=Active` 才把 `asset://<Asset ID>` 作为人物图片 URL 写入 Seedance 请求。`GetAsset` 的临时查询错误有限重试；`Processing` 持续查询，`Failed` 或超时停止并保留状态。提示词仍使用 `@图片N`，不写 Asset ID。产品图继续使用普通 TOS URL。
 
 当前写入角色没有 `DeleteObject` 和对象 TTL 权限，因此 Skill 不尝试删除上传对象；目标 Bucket 必须在 `mainPath` 下配置短期生命周期，避免素材长期残留。提交脚本会在检测到指向 `127.0.0.1:7890` 或 `localhost:7890` 的 HTTP(S) 代理时移除对应大小写环境变量，并设置 `NO_PROXY=*` 与 `no_proxy=*`，避免 STS、TOS 和 Ark 继续使用不可用的系统代理。
 
@@ -195,6 +210,8 @@ Seedance 使用 `seedance/tasks.json` 持久化上传对象、任务 ID 和状�
 - 创建请求结果未知时标记 `create_ambiguous`，不自动重发。
 - `failed`、`cancelled`、`expired` 不自动创建新任务；用户再次明确确认后才能使用显式重试参数。
 - 查询和结果下载可安全重试。下载文件未通过时长、音轨或可读性校验时，归档为 `.invalid_N`，并通过已有成功任务重新下载，不创建新任务。成功后立即保存到本地，因为远程结果 URL 会过期。
+- 人物 Asset 状态同时保存 `ProjectName`、Group ID、Asset ID、创建状态和最近查询状态。已有 Asset ID 时只调用 `GetAsset`；创建结果未知时标记 `create_ambiguous`，不自动重复创建素材组或素材。
+- 人物 Asset 的失败重试与未知创建结果处理使用独立确认参数，不继承视频任务的重试授权。
 
 ## 交付
 

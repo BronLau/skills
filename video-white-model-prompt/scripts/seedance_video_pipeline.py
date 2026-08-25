@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import mimetypes
@@ -20,6 +21,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable
@@ -28,6 +30,7 @@ from urllib.parse import urlparse
 
 from media_preflight import (
     MediaPreflightError,
+    SEEDANCE_MAX_IMAGE_BYTES,
     validate_seedance_image_input as validate_seedance_image_input_shared,
 )
 from qwen_video_prompt_reverse import SEGMENT_HEADER_PATTERN
@@ -43,11 +46,15 @@ MODEL_DURATION_RANGE_BY_SEGMENT_MAX_SECONDS = {
 }
 DEFAULT_RESOLUTION = "720p"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+ARK_OPENAPI_HOST = "open.volcengineapi.com"
+ARK_ASSET_API_VERSION = "2024-01-01"
 MIN_GENERATION_SECONDS = 4
 MAX_GENERATION_SECONDS = 30
 MAX_SEED = 2**31 - 1
 MIN_REFERENCE_VIDEO_SECONDS = 2
 MAX_REFERENCE_VIDEO_SECONDS = 30
+ASSET_QUERY_MAX_ATTEMPTS = 3
+ASSET_QUERY_RETRY_BASE_SECONDS = 1.0
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
 SUPPORTED_RATIOS = {
     "21:9": (1470, 630),
@@ -104,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--source-video", type=Path, required=True)
     prepare.add_argument("--depth-dir", type=Path)
     prepare.add_argument("--character-image", type=Path)
+    prepare.add_argument(
+        "--character-image-type",
+        choices=("virtual", "real"),
+    )
+    prepare.add_argument("--character-asset-id")
+    prepare.add_argument("--confirm-virtual-portrait-rights", action="store_true")
     prepare.add_argument("--product-image", type=Path, action="append", default=[])
     prepare.add_argument("--transcript-file", type=Path)
     prepare.add_argument("--output-dir", type=Path, required=True)
@@ -132,8 +145,19 @@ def parse_args() -> argparse.Namespace:
     submit.add_argument("--poll-interval", type=float, default=30.0)
     submit.add_argument("--poll-timeout", type=float, default=7200.0)
     submit.add_argument("--signed-url-ttl", type=int, default=7 * 24 * 3600)
+    submit.add_argument(
+        "--asset-project-name",
+        default=os.environ.get("ARK_PROJECT_NAME", "default"),
+    )
+    submit.add_argument("--asset-poll-interval", type=float, default=10.0)
+    submit.add_argument("--asset-poll-timeout", type=float, default=1800.0)
     submit.add_argument("--retry-failed", action="store_true")
     submit.add_argument("--allow-recreate-ambiguous", action="store_true")
+    submit.add_argument("--retry-failed-character-asset", action="store_true")
+    submit.add_argument(
+        "--allow-recreate-ambiguous-character-asset",
+        action="store_true",
+    )
     return parser.parse_args()
 
 
@@ -142,6 +166,153 @@ def require_file(path: Path, label: str) -> Path:
     if not resolved.is_file() or not os.access(resolved, os.R_OK):
         raise SeedanceError(f"{label}不存在或不可读：{resolved}")
     return resolved
+
+
+def normalize_asset_id(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = value.strip()
+    if normalized.startswith("asset://"):
+        normalized = normalized[len("asset://") :]
+    if not re.fullmatch(r"asset-[A-Za-z0-9-]+", normalized):
+        raise SeedanceError(f"虚拟人像 Asset ID 格式无效：{value}")
+    return normalized
+
+
+def validate_character_reference_plan(
+    plan: dict[str, Any],
+) -> dict[str, Any] | None:
+    images = list(plan.get("images") or [])
+    schema_version = int(plan.get("schema_version") or 1)
+    if images and schema_version < 2:
+        raise SeedanceError(
+            "旧版 Seedance 图片计划缺少参考角色信息；请重新运行 prepare。"
+        )
+    character_images = []
+    for image in images:
+        role = str(image.get("reference_role") or "")
+        if role not in {"character", "product"}:
+            raise SeedanceError(f"Seedance 图片参考角色无效：{role or '空'}")
+        if role == "character":
+            character_images.append(image)
+    reference = plan.get("character_reference")
+    if not character_images:
+        if reference is not None:
+            raise SeedanceError("计划包含人物引用配置，但没有人物图片。")
+        return None
+    if len(character_images) != 1 or not isinstance(reference, dict):
+        raise SeedanceError("当前计划必须且只能包含一张已配置的人物图片。")
+    if str(reference.get("image_id") or "") != str(character_images[0].get("id") or ""):
+        raise SeedanceError("人物引用配置与人物图片 ID 不一致。")
+    portrait_type = str(reference.get("portrait_type") or "")
+    asset_id = normalize_asset_id(reference.get("asset_id"))
+    if portrait_type == "virtual":
+        if not bool(reference.get("virtual_rights_confirmed")):
+            raise SeedanceError("虚拟人像计划缺少素材权利确认。")
+    elif portrait_type == "real":
+        if not asset_id:
+            raise SeedanceError("真人肖像计划必须包含已授权的 Asset ID。")
+    else:
+        raise SeedanceError(f"人物类型无效：{portrait_type or '空'}")
+    return reference
+
+
+def plan_requires_storage(
+    plan: dict[str, Any],
+    character_reference: dict[str, Any] | None,
+) -> bool:
+    if any(segment.get("depth_video") for segment in plan.get("segments") or []):
+        return True
+    for image in plan.get("images") or []:
+        role = str(image.get("reference_role") or "")
+        if role == "product":
+            return True
+        if role == "character" and (
+            character_reference is None
+            or not normalize_asset_id(character_reference.get("asset_id"))
+        ):
+            return True
+    return False
+
+
+def character_image_asset(plan: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        image
+        for image in plan.get("images") or []
+        if image.get("reference_role") == "character"
+    ]
+    if len(matches) != 1:
+        raise SeedanceError("计划缺少唯一的人物图片。")
+    return matches[0]
+
+
+def character_image_digest(plan: dict[str, Any]) -> str:
+    identity = character_image_asset(plan).get("identity")
+    if not isinstance(identity, dict):
+        raise SeedanceError("人物图片缺少文件身份信息；请重新运行 prepare。")
+    digest = str(identity.get("sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SeedanceError("人物图片缺少有效 SHA-256；请重新运行 prepare。")
+    return digest
+
+
+def validate_character_asset_identity(
+    plan: dict[str, Any],
+    asset_result: dict[str, Any],
+) -> None:
+    remote_url = str(asset_result.get("URL") or "")
+    if not remote_url:
+        raise SeedanceError("GetAsset 响应缺少人物素材 URL，无法校验一致性。")
+    local_path = validate_identity(
+        character_image_asset(plan)["identity"],
+        "人物形象图",
+    )
+    request = urllib.request.Request(
+        remote_url,
+        headers={"User-Agent": "Codex/Seedance-Asset-Check"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            remote_bytes = response.read(SEEDANCE_MAX_IMAGE_BYTES + 1)
+    except Exception as exc:
+        raise SeedanceError(f"人物 Asset 图片下载失败：{exc}") from exc
+    if not remote_bytes or len(remote_bytes) >= SEEDANCE_MAX_IMAGE_BYTES:
+        raise SeedanceError("人物 Asset 图片为空或达到 30 MB 上限。")
+    local_bytes = local_path.read_bytes()
+    if hashlib.sha256(local_bytes).digest() == hashlib.sha256(remote_bytes).digest():
+        return
+    try:
+        import numpy as np
+        from PIL import Image, ImageOps
+
+        with Image.open(local_path) as local_image:
+            local_rgb = ImageOps.exif_transpose(local_image).convert("RGB")
+            local_ratio = local_rgb.width / local_rgb.height
+            local_array = np.asarray(
+                local_rgb.resize((256, 256)), dtype=np.float32
+            ) / 255.0
+        with Image.open(io.BytesIO(remote_bytes)) as remote_image:
+            remote_rgb = ImageOps.exif_transpose(remote_image).convert("RGB")
+            remote_ratio = remote_rgb.width / remote_rgb.height
+            remote_array = np.asarray(
+                remote_rgb.resize((256, 256)), dtype=np.float32
+            ) / 255.0
+    except Exception as exc:
+        raise SeedanceError(f"人物 Asset 图片无法解码：{exc}") from exc
+    if abs(local_ratio - remote_ratio) > max(0.02, local_ratio * 0.02):
+        raise SeedanceError("人物 Asset 与本地人物图宽高比不一致。")
+    mean_error = float(np.mean(np.abs(local_array - remote_array)))
+    local_gray = local_array.mean(axis=2).reshape(-1)
+    remote_gray = remote_array.mean(axis=2).reshape(-1)
+    if float(local_gray.std()) < 1e-6 or float(remote_gray.std()) < 1e-6:
+        correlation = 1.0 if mean_error <= 0.03 else 0.0
+    else:
+        correlation = float(np.corrcoef(local_gray, remote_gray)[0, 1])
+    if not np.isfinite(correlation) or mean_error > 0.12 or correlation < 0.85:
+        raise SeedanceError(
+            "人物 Asset 与本地人物图视觉不一致："
+            f"mean_error={mean_error:.3f}, correlation={correlation:.3f}"
+        )
 
 
 def file_sha256(path: Path) -> str:
@@ -487,6 +658,23 @@ def prepare(args: argparse.Namespace) -> Path:
         if args.character_image
         else None
     )
+    character_image_type = str(args.character_image_type or "")
+    character_asset_id = normalize_asset_id(args.character_asset_id)
+    if character_image:
+        if not character_image_type:
+            raise SeedanceError(
+                "提供人物形象图时必须指定 --character-image-type virtual 或 real。"
+            )
+        if character_image_type == "virtual" and not args.confirm_virtual_portrait_rights:
+            raise SeedanceError(
+                "创建私域虚拟人像前必须明确确认素材权利与虚拟人像属性。"
+            )
+        if character_image_type == "real" and not character_asset_id:
+            raise SeedanceError(
+                "真人肖像不能上传至私域虚拟人像库；请提供已授权的 --character-asset-id。"
+            )
+    elif character_image_type or character_asset_id or args.confirm_virtual_portrait_rights:
+        raise SeedanceError("人物人像参数必须与 --character-image 一起使用。")
     product_images = [
         require_file(path, f"第 {index} 张产品图")
         for index, path in enumerate(args.product_image, start=1)
@@ -540,15 +728,19 @@ def prepare(args: argparse.Namespace) -> Path:
     if not -1 <= seed <= MAX_SEED:
         raise SeedanceError(f"--seed 必须在 -1 到 {MAX_SEED} 之间。")
 
-    image_assets = [
-        {
-            "id": f"image-{index:02d}",
-            "index": index,
-            "kind": "image",
-            "identity": file_identity(image),
-        }
-        for index, image in enumerate(images, start=1)
-    ]
+    image_assets: list[dict[str, Any]] = []
+    for index, image in enumerate(images, start=1):
+        image_assets.append(
+            {
+                "id": f"image-{index:02d}",
+                "index": index,
+                "kind": "image",
+                "reference_role": (
+                    "character" if character_image and index == 1 else "product"
+                ),
+                "identity": file_identity(image),
+            }
+        )
     prepared_segments: list[dict[str, Any]] = []
     for segment, prompt_body in zip(segments, prompt_bodies):
         index = int(segment["index"])
@@ -574,7 +766,7 @@ def prepare(args: argparse.Namespace) -> Path:
         )
 
     plan_body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "prepared",
         "run_id": uuid.uuid4().hex,
         "model": model_id,
@@ -584,6 +776,18 @@ def prepare(args: argparse.Namespace) -> Path:
         "prompt": file_identity(prompt_path),
         "segment_plan": file_identity(plan_path),
         "images": image_assets,
+        "character_reference": (
+            {
+                "image_id": "image-01",
+                "portrait_type": character_image_type,
+                "asset_id": character_asset_id or None,
+                "virtual_rights_confirmed": bool(
+                    args.confirm_virtual_portrait_rights
+                ),
+            }
+            if character_image
+            else None
+        ),
         "parameters": {
             "resolution": args.resolution,
             "ratio": ratio,
@@ -662,7 +866,10 @@ def normalize_tos_config(body: dict[str, Any]) -> dict[str, str]:
     return config
 
 
-def load_tos_config(path: Path | None) -> dict[str, str]:
+def load_tos_config(
+    path: Path | None,
+    require_storage: bool = True,
+) -> dict[str, str]:
     config: dict[str, str] = {}
     if path:
         resolved = path.expanduser().resolve()
@@ -706,18 +913,22 @@ def load_tos_config(path: Path | None) -> dict[str, str]:
         value = os.environ.get(environment_name, "").strip()
         if value:
             config[key] = value
-    required = ("access_key", "secret_key", "endpoint", "region", "bucket")
+    required = (
+        ("access_key", "secret_key", "endpoint", "region", "bucket")
+        if require_storage
+        else ("access_key", "secret_key", "region")
+    )
     missing = [key for key in required if not config.get(key)]
     if missing:
         raise SeedanceError("火山 TOS 配置缺少字段：" + ", ".join(missing))
-    if not config.get("prefix"):
+    if require_storage and not config.get("prefix"):
         main_path = config.get("main_path", "").strip("/")
         config["prefix"] = (
             f"{main_path}/video-white-model-prompt"
             if main_path
             else "video-white-model-prompt"
         )
-    if config.get("public_domain"):
+    if require_storage and config.get("public_domain"):
         config["public_domain"] = config["public_domain"].rstrip("/")
     return config
 
@@ -826,6 +1037,361 @@ class TosPublisher:
             "url": result.signed_url,
             "url_expires_at": int(time.time()) + self.signed_url_ttl,
         }
+
+
+class ArkAssetLibrary:
+    def __init__(self, config: dict[str, str], project_name: str) -> None:
+        try:
+            from volcengine.ApiInfo import ApiInfo
+            from volcengine.Credentials import Credentials
+            from volcengine.ServiceInfo import ServiceInfo
+            from volcengine.base.Service import Service
+        except ImportError as exc:
+            raise SeedanceError(
+                "私域虚拟人像资产需要 volcengine SDK。"
+            ) from exc
+        self.project_name = project_name.strip() or "default"
+        credentials = Credentials(
+            config["access_key"],
+            config["secret_key"],
+            "ark",
+            config["region"],
+            config.get("security_token", ""),
+        )
+        service_info = ServiceInfo(
+            ARK_OPENAPI_HOST,
+            {},
+            credentials,
+            10,
+            30,
+            scheme="https",
+        )
+        actions = (
+            "CreateAssetGroup",
+            "CreateAsset",
+            "GetAsset",
+            "ListAssets",
+        )
+        api_info = {
+            action: ApiInfo(
+                "POST",
+                "/",
+                {"Action": action, "Version": ARK_ASSET_API_VERSION},
+                {},
+                {},
+            )
+            for action in actions
+        }
+        self.service = Service(service_info, api_info)
+        self.service.set_ak(config["access_key"])
+        self.service.set_sk(config["secret_key"])
+        if config.get("security_token"):
+            self.service.set_session_token(config["security_token"])
+
+    def call(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            raw = self.service.json(
+                action,
+                {},
+                json.dumps(body, ensure_ascii=False),
+            )
+            response = json.loads(raw)
+        except Exception as exc:
+            raise SeedanceError(f"私域人像资产 API {action} 调用失败：{exc}") from exc
+        if not isinstance(response, dict):
+            raise SeedanceError(f"私域人像资产 API {action} 响应无效。")
+        result = response.get("Result", response)
+        if not isinstance(result, dict):
+            raise SeedanceError(f"私域人像资产 API {action} 缺少结果对象。")
+        return result
+
+    def create_group(self, name: str, description: str) -> str:
+        result = self.call(
+            "CreateAssetGroup",
+            {
+                "Name": name,
+                "Description": description,
+                "GroupType": "AIGC",
+                "ProjectName": self.project_name,
+            },
+        )
+        group_id = str(result.get("Id") or "")
+        if not group_id:
+            raise SeedanceError("CreateAssetGroup 响应缺少 Group ID。")
+        return group_id
+
+    def find_asset(self, name: str) -> dict[str, Any] | None:
+        result = self.call(
+            "ListAssets",
+            {
+                "Filter": {
+                    "GroupType": "AIGC",
+                    "Statuses": ["Active", "Processing"],
+                    "Name": name,
+                },
+                "PageNumber": 1,
+                "PageSize": 100,
+                "SortBy": "CreateTime",
+                "SortOrder": "Desc",
+            },
+        )
+        items = result.get("Items") or []
+        if not isinstance(items, list):
+            raise SeedanceError("ListAssets 响应中的 Items 无效。")
+        exact = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("Name") or "") == name
+            and str(item.get("ProjectName") or self.project_name)
+            == self.project_name
+        ]
+        exact.sort(
+            key=lambda item: (
+                str(item.get("Status") or "") == "Active",
+                str(item.get("CreateTime") or ""),
+            ),
+            reverse=True,
+        )
+        return exact[0] if exact else None
+
+    def create_asset(self, group_id: str, url: str, name: str) -> str:
+        result = self.call(
+            "CreateAsset",
+            {
+                "GroupId": group_id,
+                "URL": url,
+                "AssetType": "Image",
+                "Name": name,
+                "ProjectName": self.project_name,
+            },
+        )
+        asset_id = str(result.get("Id") or "")
+        if not asset_id:
+            raise SeedanceError("CreateAsset 响应缺少 Asset ID。")
+        return asset_id
+
+    def get_asset(self, asset_id: str) -> dict[str, Any]:
+        return self.call(
+            "GetAsset",
+            {"Id": asset_id, "ProjectName": self.project_name},
+        )
+
+
+def get_character_asset_with_retry(
+    library: Any,
+    asset_id: str,
+    retry_base_delay: float,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, ASSET_QUERY_MAX_ATTEMPTS + 1):
+        try:
+            result = library.get_asset(asset_id)
+            if not isinstance(result, dict):
+                raise SeedanceError("GetAsset 响应无效。")
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt >= ASSET_QUERY_MAX_ATTEMPTS:
+                break
+            delay = retry_base_delay * (2 ** (attempt - 1))
+            print(
+                "SEEDANCE character_asset_query_retry "
+                f"asset={asset_id} attempt={attempt + 1}/"
+                f"{ASSET_QUERY_MAX_ATTEMPTS} error={exc}",
+                flush=True,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise SeedanceError(
+        f"GetAsset 连续查询 {ASSET_QUERY_MAX_ATTEMPTS} 次失败：{last_error}"
+    ) from last_error
+
+
+def ensure_character_asset_uri(
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    library: Any,
+    character_url: str | Callable[[], str] | None,
+    project_name: str,
+    poll_interval: float,
+    poll_timeout: float,
+    retry_failed: bool,
+    allow_recreate_ambiguous: bool,
+) -> str | None:
+    reference = plan.get("character_reference")
+    if not isinstance(reference, dict):
+        return None
+    portrait_type = str(reference.get("portrait_type") or "")
+    planned_asset_id = normalize_asset_id(reference.get("asset_id"))
+    character_state = state.setdefault("character_asset", {})
+    recorded_project = str(character_state.get("project_name") or "")
+    if recorded_project and recorded_project != project_name:
+        raise SeedanceError(
+            "恢复时私域人像 ProjectName 与原状态不一致："
+            f"{recorded_project} != {project_name}"
+        )
+    character_state["project_name"] = project_name
+    character_state["portrait_type"] = portrait_type
+
+    if planned_asset_id:
+        recorded_asset_id = normalize_asset_id(character_state.get("asset_id"))
+        if recorded_asset_id and recorded_asset_id != planned_asset_id:
+            raise SeedanceError("恢复时人物 Asset ID 与计划不一致。")
+        character_state.update(
+            {"asset_id": planned_asset_id, "source": "provided"}
+        )
+        atomic_write_json(state_path, state)
+    elif portrait_type == "real":
+        raise SeedanceError("真人肖像必须提供已授权的 Asset ID。")
+    else:
+        if str(character_state.get("status") or "") == "Failed":
+            if not retry_failed:
+                raise SeedanceError(
+                    "私域人像素材上次处理失败，不会自动创建新素材。"
+                )
+            character_state.pop("asset_id", None)
+            character_state.pop("status", None)
+            character_state.pop("asset_create_status", None)
+            character_state.pop("source", None)
+            atomic_write_json(state_path, state)
+
+        asset_name = f"vwm-{character_image_digest(plan)[:32]}"
+        asset_id = normalize_asset_id(character_state.get("asset_id"))
+        if not asset_id:
+            finder = getattr(library, "find_asset", None)
+            discovered = finder(asset_name) if callable(finder) else None
+            if isinstance(discovered, dict):
+                discovered_asset_id = normalize_asset_id(discovered.get("Id"))
+                if discovered_asset_id:
+                    character_state.update(
+                        {
+                            "asset_id": discovered_asset_id,
+                            "group_id": str(discovered.get("GroupId") or ""),
+                            "asset_create_status": "discovered",
+                            "source": "discovered",
+                        }
+                    )
+                    character_state.pop("error", None)
+                    atomic_write_json(state_path, state)
+                    asset_id = discovered_asset_id
+
+        if not asset_id:
+            asset_status = str(character_state.get("asset_create_status") or "")
+            if asset_status == "create_ambiguous":
+                if not allow_recreate_ambiguous:
+                    raise SeedanceError(
+                        "私域人像素材创建结果未知，拒绝自动重复创建。"
+                    )
+                character_state.pop("asset_create_status", None)
+
+            group_status = str(character_state.get("group_create_status") or "")
+            if group_status == "create_ambiguous":
+                if not allow_recreate_ambiguous:
+                    raise SeedanceError(
+                        "私域人像素材组创建结果未知，拒绝自动重复创建。"
+                    )
+                character_state.pop("group_id", None)
+                character_state.pop("group_create_status", None)
+            group_id = str(character_state.get("group_id") or "")
+            if not group_id:
+                try:
+                    group_id = library.create_group(
+                        f"vwm-{plan['run_id'][:20]}",
+                        "video-white-model-prompt virtual portrait",
+                    )
+                except Exception as exc:
+                    character_state.update(
+                        {
+                            "group_create_status": "create_ambiguous",
+                            "error": str(exc),
+                        }
+                    )
+                    atomic_write_json(state_path, state)
+                    raise SeedanceError(
+                        "私域人像素材组创建结果未知，不会自动重复创建。"
+                    ) from exc
+                character_state.update(
+                    {"group_id": group_id, "group_create_status": "created"}
+                )
+                character_state.pop("error", None)
+                atomic_write_json(state_path, state)
+
+            if not character_url:
+                raise SeedanceError("创建私域虚拟人像缺少可访问的图片 URL。")
+            resolved_character_url = (
+                character_url() if callable(character_url) else character_url
+            )
+            if not resolved_character_url:
+                raise SeedanceError("创建私域虚拟人像缺少可访问的图片 URL。")
+            try:
+                asset_id = library.create_asset(
+                    group_id,
+                    resolved_character_url,
+                    asset_name,
+                )
+            except Exception as exc:
+                character_state.update(
+                    {"asset_create_status": "create_ambiguous", "error": str(exc)}
+                )
+                atomic_write_json(state_path, state)
+                raise SeedanceError(
+                    "私域人像素材创建结果未知，不会自动重复创建。"
+                ) from exc
+            character_state.update(
+                {
+                    "asset_id": asset_id,
+                    "asset_create_status": "created",
+                    "source": "created",
+                }
+            )
+            character_state.pop("error", None)
+            atomic_write_json(state_path, state)
+
+    asset_id = normalize_asset_id(character_state.get("asset_id"))
+    deadline = time.monotonic() + poll_timeout
+    query_retry_delay = min(max(poll_interval, 0.0), ASSET_QUERY_RETRY_BASE_SECONDS)
+    while True:
+        try:
+            result = get_character_asset_with_retry(
+                library,
+                asset_id,
+                query_retry_delay,
+            )
+        except SeedanceError as exc:
+            character_state["error"] = str(exc)
+            atomic_write_json(state_path, state)
+            raise
+        status = str(result.get("Status") or "")
+        if not status:
+            raise SeedanceError("GetAsset 响应缺少素材状态。")
+        response_asset_id = normalize_asset_id(result.get("Id"))
+        if response_asset_id and response_asset_id != asset_id:
+            raise SeedanceError("GetAsset 返回的 Asset ID 与请求不一致。")
+        response_project = str(result.get("ProjectName") or "")
+        if response_project and response_project != project_name:
+            raise SeedanceError(
+                "人物素材所属 ProjectName 与提交配置不一致："
+                f"{response_project} != {project_name}"
+            )
+        character_state["status"] = status
+        character_state["last_checked_at"] = int(time.time())
+        character_state.pop("error", None)
+        atomic_write_json(state_path, state)
+        print(f"SEEDANCE character_asset={asset_id} status={status}", flush=True)
+        if status == "Active":
+            if str(character_state.get("source") or "") in {
+                "provided",
+                "discovered",
+            }:
+                validate_character_asset_identity(plan, result)
+            return f"asset://{asset_id}"
+        if status == "Failed":
+            raise SeedanceError("私域人像素材处理失败，无法用于视频生成。")
+        if time.monotonic() >= deadline:
+            raise SeedanceError("私域人像素材处理超时，可稍后恢复查询。")
+        time.sleep(poll_interval)
 
 
 def sdk_json(value: Any) -> dict[str, Any]:
@@ -1132,11 +1698,13 @@ def submit(
     args: argparse.Namespace,
     client_factory: Callable[[str], Any] | None = None,
     publisher_factory: Callable[[dict[str, str], int], Any] | None = None,
+    asset_library_factory: Callable[[dict[str, str], str], Any] | None = None,
 ) -> Path:
     plan_path = require_file(args.plan, "Seedance 计划")
     plan = load_json(plan_path, "Seedance 计划")
     if plan.get("status") != "prepared":
         raise SeedanceError("Seedance 计划状态无效。")
+    character_reference = validate_character_reference_plan(plan)
     validate_identity(plan["source_video"], "原始参考视频")
     validate_identity(plan["prompt"], "最终提示词")
     segment_plan_path = validate_identity(plan["segment_plan"], "分段计划")
@@ -1160,12 +1728,10 @@ def submit(
             validate_identity(segment["depth_video"], f"第 {segment['index']} 段白模")
 
     api_key = resolve_ark_api_key(args.ark_api_key_file)
+    requires_storage = plan_requires_storage(plan, character_reference)
     tos_config = (
-        load_tos_config(args.tos_config_file)
-        if (
-            plan.get("images")
-            or any(segment.get("depth_video") for segment in plan["segments"])
-        )
+        load_tos_config(args.tos_config_file, require_storage=requires_storage)
+        if requires_storage or character_reference is not None
         else None
     )
     if client_factory is None:
@@ -1186,9 +1752,9 @@ def submit(
         client_factory = default_client_factory
     client = client_factory(api_key)
     publisher = None
-    if tos_config:
-        factory = publisher_factory or TosPublisher
-        publisher = factory(tos_config, args.signed_url_ttl)
+    if tos_config and requires_storage:
+        publisher_builder = publisher_factory or TosPublisher
+        publisher = publisher_builder(tos_config, args.signed_url_ttl)
 
     state_path = plan_path.with_name("tasks.json")
     if state_path.exists():
@@ -1203,6 +1769,17 @@ def submit(
             "segments": {},
         }
         atomic_write_json(state_path, state)
+
+    asset_library = None
+    project_name = (
+        str(getattr(args, "asset_project_name", "default") or "default").strip()
+        or "default"
+    )
+    if isinstance(character_reference, dict):
+        if tos_config is None:
+            raise SeedanceError("人物 Asset 校验或创建缺少火山 AK/SK 配置。")
+        asset_library_builder = asset_library_factory or ArkAssetLibrary
+        asset_library = asset_library_builder(tos_config, project_name)
 
     def asset_url(asset_id: str, identity: dict[str, Any]) -> str:
         if publisher is None:
@@ -1221,10 +1798,45 @@ def submit(
         atomic_write_json(state_path, state)
         return str(upload["url"])
 
-    image_urls = [
-        asset_url(str(asset["id"]), asset["identity"])
-        for asset in plan.get("images") or []
-    ]
+    image_urls: list[str] = []
+    for asset in plan.get("images") or []:
+        if (
+            asset.get("reference_role") == "character"
+            and isinstance(character_reference, dict)
+        ):
+            if asset_library is None:
+                raise SeedanceError("内部错误：缺少私域人像素材客户端。")
+            planned_asset_id = normalize_asset_id(character_reference.get("asset_id"))
+            character_url = None
+            if not planned_asset_id:
+                character_url = partial(
+                    asset_url,
+                    str(asset["id"]),
+                    asset["identity"],
+                )
+            character_asset_uri = ensure_character_asset_uri(
+                plan,
+                state,
+                state_path,
+                asset_library,
+                character_url,
+                project_name,
+                float(getattr(args, "asset_poll_interval", 10.0)),
+                float(getattr(args, "asset_poll_timeout", 1800.0)),
+                bool(getattr(args, "retry_failed_character_asset", False)),
+                bool(
+                    getattr(
+                        args,
+                        "allow_recreate_ambiguous_character_asset",
+                        False,
+                    )
+                ),
+            )
+            if not character_asset_uri:
+                raise SeedanceError("内部错误：人物 Asset URI 为空。")
+            image_urls.append(character_asset_uri)
+        else:
+            image_urls.append(asset_url(str(asset["id"]), asset["identity"]))
     responses_dir = plan_path.parent / "responses"
     responses_dir.mkdir(exist_ok=True)
 
@@ -1477,6 +2089,10 @@ def main() -> int:
             configure_network_environment()
             if args.poll_interval < 0 or args.poll_timeout <= 0:
                 raise SeedanceError("轮询间隔不能为负数，超时时间必须为正数。")
+            if args.asset_poll_interval < 0 or args.asset_poll_timeout <= 0:
+                raise SeedanceError(
+                    "素材轮询间隔不能为负数，超时时间必须为正数。"
+                )
             if not 3600 <= args.signed_url_ttl <= 7 * 24 * 3600:
                 raise SeedanceError("TOS 签名 URL 有效期必须在 1 小时到 7 天之间。")
             submit(args)

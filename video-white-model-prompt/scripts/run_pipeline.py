@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--product-name", default="")
     parser.add_argument("--product-image", type=Path, action="append", default=[])
     parser.add_argument("--character-image", type=Path)
+    parser.add_argument(
+        "--character-image-type",
+        choices=("virtual", "real"),
+    )
+    parser.add_argument("--character-asset-id")
+    parser.add_argument("--confirm-virtual-portrait-rights", action="store_true")
     parser.add_argument("--selling-points", default="")
     parser.add_argument("--user-idea", default="")
     parser.add_argument("--allow-audio-rewrite", action="store_true")
@@ -251,6 +257,14 @@ def run_manifest(
         body["allow_audio_rewrite"] = True
     if args.spoken_replacement:
         body["spoken_replacements"] = list(args.spoken_replacement)
+    if character_image:
+        body["character_reference"] = {
+            "portrait_type": args.character_image_type,
+            "asset_id": args.character_asset_id or None,
+            "virtual_rights_confirmed": bool(
+                args.confirm_virtual_portrait_rights
+            ),
+        }
     return body
 
 
@@ -357,6 +371,13 @@ def build_seedance_prepare_command(
         command.extend(["--depth-dir", str(output_dir / "depth")])
     if character_image:
         command.extend(["--character-image", str(character_image)])
+        command.extend(
+            ["--character-image-type", str(args.character_image_type)]
+        )
+        if args.character_asset_id:
+            command.extend(["--character-asset-id", args.character_asset_id])
+        if args.confirm_virtual_portrait_rights:
+            command.append("--confirm-virtual-portrait-rights")
     for image in product_images:
         command.extend(["--product-image", str(image)])
     if transcript_file:
@@ -399,6 +420,26 @@ def main() -> int:
             if args.character_image
             else None
         )
+        if character_image:
+            if not args.character_image_type:
+                raise PipelineError(
+                    "提供人物形象图时必须指定 virtual 或 real 人像类型。"
+                )
+            if (
+                args.character_image_type == "virtual"
+                and not args.confirm_virtual_portrait_rights
+            ):
+                raise PipelineError(
+                    "创建私域虚拟人像前必须明确确认素材权利与虚拟人像属性。"
+                )
+            if args.character_image_type == "real" and not args.character_asset_id:
+                raise PipelineError("真人肖像必须提供已授权的人物 Asset ID。")
+        elif (
+            args.character_image_type
+            or args.character_asset_id
+            or args.confirm_virtual_portrait_rights
+        ):
+            raise PipelineError("人物人像参数必须与 --character-image 一起使用。")
         transcript_file = (
             require_file(args.transcript_file, "音轨转写文件")
             if args.transcript_file
@@ -408,6 +449,9 @@ def main() -> int:
             args.product_name.strip()
             or product_images
             or character_image
+            or args.character_image_type
+            or args.character_asset_id
+            or args.confirm_virtual_portrait_rights
             or args.selling_points.strip()
             or args.user_idea.strip()
             or args.allow_audio_rewrite

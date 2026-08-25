@@ -59,6 +59,9 @@ class ResumePipelineTests(unittest.TestCase):
             product_name="",
             product_image=[],
             character_image=None,
+            character_image_type=None,
+            character_asset_id=None,
+            confirm_virtual_portrait_rights=False,
             selling_points="",
             user_idea="",
             allow_audio_rewrite=False,
@@ -314,6 +317,36 @@ class ResumePipelineTests(unittest.TestCase):
         self.assertNotEqual(short_command, long_command)
         self.assertNotIn("-b:v 800k", short_command)
         self.assertIn("-ac 1", short_command)
+
+    def test_character_asset_options_are_forwarded_to_seedance_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "input.mp4"
+            prompt = root / "prompt.txt"
+            plan = root / "segment_plan.json"
+            character = root / "character.png"
+            for path in (video, prompt, plan, character):
+                path.write_bytes(b"data")
+            args = self.make_args(root, video)
+            args.character_image = character
+            args.character_image_type = "virtual"
+            args.confirm_virtual_portrait_rights = True
+
+            command = MODULE.build_seedance_prepare_command(
+                args,
+                video,
+                prompt,
+                plan,
+                root / "output",
+                character,
+                [],
+                None,
+                False,
+            )
+
+            self.assertIn("--character-image-type", command)
+            self.assertIn("virtual", command)
+            self.assertIn("--confirm-virtual-portrait-rights", command)
 
     def test_resume_reuses_draft_and_depth_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

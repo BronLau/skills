@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -70,6 +71,9 @@ class SeedancePipelineTests(unittest.TestCase):
             source_video=source,
             depth_dir=None,
             character_image=None,
+            character_image_type=None,
+            character_asset_id=None,
+            confirm_virtual_portrait_rights=False,
             product_image=[],
             transcript_file=None,
             output_dir=root / "seedance",
@@ -168,6 +172,512 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertEqual(
                 body["segments"][0]["depth_video"]["path"], str(depth.resolve())
             )
+
+    def test_prepare_virtual_character_records_private_asset_contract(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "参考@图片1中的虚拟人物，将其定义为<主播>。\n"
+                "镜头1[00:00-00:10] <主播>展示产品。\n",
+                encoding="utf-8",
+            )
+            character = root / "virtual-character.png"
+            Image.new("RGB", (720, 1280), "blue").save(character)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.character_image = character
+            args.character_image_type = "virtual"
+            args.confirm_virtual_portrait_rights = True
+
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(body["images"][0]["reference_role"], "character")
+            self.assertEqual(
+                body["character_reference"],
+                {
+                    "image_id": "image-01",
+                    "portrait_type": "virtual",
+                    "asset_id": None,
+                    "virtual_rights_confirmed": True,
+                },
+            )
+
+    def test_prepare_real_character_requires_authorized_asset_id(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "参考@图片1中的人物，将其定义为<主播>。\n"
+                "镜头1[00:00-00:10] <主播>展示产品。\n",
+                encoding="utf-8",
+            )
+            character = root / "real-character.png"
+            Image.new("RGB", (720, 1280), "blue").save(character)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.character_image = character
+            args.character_image_type = "real"
+
+            with self.assertRaisesRegex(MODULE.SeedanceError, "已授权"):
+                MODULE.prepare(args)
+
+    def test_virtual_character_asset_creation_is_persisted_and_polled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            character.write_bytes(b"character")
+            state_path = root / "tasks.json"
+            state = {"schema_version": 1, "run_id": "run-id", "uploads": {}, "segments": {}}
+            MODULE.atomic_write_json(state_path, state)
+            plan = {
+                "run_id": "run-id",
+                "character_reference": {
+                    "portrait_type": "virtual",
+                    "asset_id": None,
+                },
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ],
+            }
+
+            class FakeLibrary:
+                def __init__(self) -> None:
+                    self.statuses = ["Processing", "Active"]
+                    self.group_calls = 0
+                    self.asset_calls = 0
+
+                def create_group(self, _: str, __: str) -> str:
+                    self.group_calls += 1
+                    return "group-test"
+
+                def create_asset(self, _: str, __: str, ___: str) -> str:
+                    self.asset_calls += 1
+                    return "asset-test"
+
+                def get_asset(self, _: str) -> dict[str, str]:
+                    return {
+                        "Status": self.statuses.pop(0),
+                        "ProjectName": "default",
+                    }
+
+            library = FakeLibrary()
+            uri = MODULE.ensure_character_asset_uri(
+                plan,
+                state,
+                state_path,
+                library,
+                "https://tos.example.com/character.png",
+                "default",
+                0,
+                5,
+                False,
+                False,
+            )
+
+            self.assertEqual(uri, "asset://asset-test")
+            self.assertEqual(library.group_calls, 1)
+            self.assertEqual(library.asset_calls, 1)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["character_asset"]["status"], "Active")
+
+    def test_existing_real_character_asset_is_validated_without_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            character.write_bytes(b"character")
+            state_path = root / "tasks.json"
+            state = {"schema_version": 1, "run_id": "run-id", "uploads": {}, "segments": {}}
+            MODULE.atomic_write_json(state_path, state)
+            plan = {
+                "run_id": "run-id",
+                "character_reference": {
+                    "portrait_type": "real",
+                    "asset_id": "asset-authorized",
+                },
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ],
+            }
+
+            class ExistingAssetLibrary:
+                def create_group(self, *_: object) -> str:
+                    raise AssertionError("不应创建素材组")
+
+                def create_asset(self, *_: object) -> str:
+                    raise AssertionError("不应创建素材")
+
+                def get_asset(self, asset_id: str) -> dict[str, str]:
+                    self.asset_id = asset_id
+                    return {
+                        "Id": asset_id,
+                        "Status": "Active",
+                        "ProjectName": "default",
+                        "URL": "https://example.invalid/character.png",
+                    }
+
+            library = ExistingAssetLibrary()
+            with mock.patch.object(
+                MODULE, "validate_character_asset_identity"
+            ) as identity_check:
+                uri = MODULE.ensure_character_asset_uri(
+                    plan,
+                    state,
+                    state_path,
+                    library,
+                    None,
+                    "default",
+                    0,
+                    5,
+                    False,
+                    False,
+                )
+
+            self.assertEqual(uri, "asset://asset-authorized")
+            self.assertEqual(library.asset_id, "asset-authorized")
+            identity_check.assert_called_once()
+
+    def test_existing_asset_with_different_character_image_is_rejected(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            Image.new("RGB", (600, 900), "red").save(character)
+            remote = io.BytesIO()
+            Image.new("RGB", (600, 900), "blue").save(remote, format="PNG")
+            response = io.BytesIO(remote.getvalue())
+            plan = {
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ]
+            }
+
+            with mock.patch.object(
+                MODULE.urllib.request,
+                "urlopen",
+                return_value=response,
+            ):
+                with self.assertRaisesRegex(MODULE.SeedanceError, "视觉不一致"):
+                    MODULE.validate_character_asset_identity(
+                        plan,
+                        {"URL": "https://example.invalid/character.png"},
+                    )
+
+    def test_ambiguous_character_group_creation_is_not_repeated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            character.write_bytes(b"character")
+            state_path = root / "tasks.json"
+            state = {"schema_version": 1, "run_id": "run-id", "uploads": {}, "segments": {}}
+            MODULE.atomic_write_json(state_path, state)
+            plan = {
+                "run_id": "run-id",
+                "character_reference": {
+                    "portrait_type": "virtual",
+                    "asset_id": None,
+                },
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ],
+            }
+
+            class AmbiguousLibrary:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def create_group(self, _: str, __: str) -> str:
+                    self.calls += 1
+                    raise TimeoutError("unknown result")
+
+            library = AmbiguousLibrary()
+            for _ in range(2):
+                with self.assertRaisesRegex(MODULE.SeedanceError, "自动重复创建"):
+                    MODULE.ensure_character_asset_uri(
+                        plan,
+                        state,
+                        state_path,
+                        library,
+                        "https://tos.example.com/character.png",
+                        "default",
+                        0,
+                        5,
+                        False,
+                        False,
+                    )
+
+            self.assertEqual(library.calls, 1)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["character_asset"]["group_create_status"],
+                "create_ambiguous",
+            )
+
+    def test_virtual_character_reuses_matching_asset_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            character.write_bytes(b"character")
+            state_path = root / "tasks.json"
+            state = {
+                "schema_version": 1,
+                "run_id": "run-id",
+                "uploads": {},
+                "segments": {},
+            }
+            MODULE.atomic_write_json(state_path, state)
+            plan = {
+                "run_id": "run-id",
+                "character_reference": {
+                    "portrait_type": "virtual",
+                    "asset_id": None,
+                },
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ],
+            }
+
+            class ReuseLibrary:
+                def find_asset(self, name: str) -> dict[str, str]:
+                    self.name = name
+                    return {
+                        "Id": "asset-existing",
+                        "GroupId": "group-existing",
+                    }
+
+                def create_group(self, *_: object) -> str:
+                    raise AssertionError("复用素材时不应创建素材组")
+
+                def create_asset(self, *_: object) -> str:
+                    raise AssertionError("复用素材时不应创建素材")
+
+                def get_asset(self, asset_id: str) -> dict[str, str]:
+                    return {
+                        "Id": asset_id,
+                        "Status": "Active",
+                        "ProjectName": "default",
+                        "URL": "https://example.invalid/character.png",
+                    }
+
+            upload_called = False
+
+            def character_url() -> str:
+                nonlocal upload_called
+                upload_called = True
+                return "https://tos.example.com/character.png"
+
+            library = ReuseLibrary()
+            with mock.patch.object(MODULE, "validate_character_asset_identity"):
+                uri = MODULE.ensure_character_asset_uri(
+                    plan,
+                    state,
+                    state_path,
+                    library,
+                    character_url,
+                    "default",
+                    0,
+                    5,
+                    False,
+                    False,
+                )
+
+            self.assertEqual(uri, "asset://asset-existing")
+            self.assertFalse(upload_called)
+            self.assertEqual(
+                library.name,
+                "vwm-" + MODULE.file_sha256(character)[:32],
+            )
+
+    def test_character_asset_resume_skips_duplicate_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character.png"
+            character.write_bytes(b"character")
+            state_path = root / "tasks.json"
+            state = {
+                "schema_version": 1,
+                "run_id": "run-id",
+                "uploads": {},
+                "segments": {},
+                "character_asset": {
+                    "project_name": "default",
+                    "portrait_type": "virtual",
+                    "asset_id": "asset-recorded",
+                    "source": "created",
+                    "status": "Processing",
+                },
+            }
+            MODULE.atomic_write_json(state_path, state)
+            plan = {
+                "run_id": "run-id",
+                "character_reference": {
+                    "portrait_type": "virtual",
+                    "asset_id": None,
+                },
+                "images": [
+                    {
+                        "reference_role": "character",
+                        "identity": MODULE.file_identity(character),
+                    }
+                ],
+            }
+
+            class ResumeLibrary:
+                def find_asset(self, _: str) -> None:
+                    raise AssertionError("恢复时不应重新搜索素材")
+
+                def get_asset(self, asset_id: str) -> dict[str, str]:
+                    return {
+                        "Id": asset_id,
+                        "Status": "Active",
+                        "ProjectName": "default",
+                    }
+
+            uri = MODULE.ensure_character_asset_uri(
+                plan,
+                state,
+                state_path,
+                ResumeLibrary(),
+                None,
+                "default",
+                0,
+                5,
+                False,
+                False,
+            )
+
+            self.assertEqual(uri, "asset://asset-recorded")
+
+    def test_get_asset_transient_failure_is_retried(self) -> None:
+        class FlakyLibrary:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_asset(self, asset_id: str) -> dict[str, str]:
+                self.calls += 1
+                if self.calls < 3:
+                    raise TimeoutError("temporary")
+                return {"Id": asset_id, "Status": "Active"}
+
+        library = FlakyLibrary()
+        result = MODULE.get_character_asset_with_retry(
+            library,
+            "asset-existing",
+            0,
+        )
+
+        self.assertEqual(result["Status"], "Active")
+        self.assertEqual(library.calls, 3)
+
+    def test_legacy_image_plan_requires_prepare_migration(self) -> None:
+        with self.assertRaisesRegex(MODULE.SeedanceError, "重新运行 prepare"):
+            MODULE.validate_character_reference_plan(
+                {
+                    "schema_version": 1,
+                    "images": [{"id": "image-01"}],
+                }
+            )
+
+    def test_asset_only_config_does_not_require_storage_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "asset.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "access_key": "ak",
+                        "secret_key": "sk",
+                        "region": "cn-beijing",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = MODULE.load_tos_config(
+                config_path,
+                require_storage=False,
+            )
+
+            self.assertEqual(config["access_key"], "ak")
+            self.assertNotIn("bucket", config)
+
+    def test_asset_library_builds_documented_openapi_requests(self) -> None:
+        captured: list[tuple[str, dict[str, object]]] = []
+
+        class FakeService:
+            def json(self, action: str, _: dict[str, object], body: str) -> str:
+                request = json.loads(body)
+                captured.append((action, request))
+                responses = {
+                    "CreateAssetGroup": {"Id": "group-created"},
+                    "CreateAsset": {"Id": "asset-created"},
+                    "GetAsset": {
+                        "Id": "asset-created",
+                        "Status": "Active",
+                        "ProjectName": "project-a",
+                    },
+                    "ListAssets": {
+                        "Items": [
+                            {
+                                "Id": "asset-existing",
+                                "Name": "vwm-hash",
+                                "ProjectName": "project-a",
+                                "Status": "Active",
+                            }
+                        ]
+                    },
+                }
+                return json.dumps(responses[action])
+
+        library = MODULE.ArkAssetLibrary.__new__(MODULE.ArkAssetLibrary)
+        library.project_name = "project-a"
+        library.service = FakeService()
+
+        self.assertEqual(
+            library.create_group("group-name", "description"),
+            "group-created",
+        )
+        self.assertEqual(
+            library.create_asset(
+                "group-created",
+                "https://example.invalid/character.png",
+                "vwm-hash",
+            ),
+            "asset-created",
+        )
+        self.assertEqual(library.get_asset("asset-created")["Status"], "Active")
+        self.assertEqual(library.find_asset("vwm-hash")["Id"], "asset-existing")
+
+        requests = {action: body for action, body in captured}
+        self.assertEqual(
+            requests["CreateAssetGroup"]["ProjectName"],
+            "project-a",
+        )
+        self.assertEqual(requests["CreateAsset"]["AssetType"], "Image")
+        self.assertEqual(requests["GetAsset"]["ProjectName"], "project-a")
+        self.assertEqual(
+            requests["ListAssets"]["Filter"]["Statuses"],
+            ["Active", "Processing"],
+        )
 
     def test_default_seedance_resolution_is_720p(self) -> None:
         self.assertEqual(MODULE.DEFAULT_RESOLUTION, "720p")
@@ -629,6 +1139,124 @@ class SeedancePipelineTests(unittest.TestCase):
             )
             self.assertEqual(state["segments"]["1"]["status"], "downloaded")
             self.assertEqual(state["full_output"]["status"], "complete")
+
+    def test_submit_uses_private_asset_uri_for_virtual_character(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, segment_plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "参考@图片1中的虚拟人物，将其定义为<主播>。\n"
+                "镜头1[00:00-00:10] <主播>展示产品。\n",
+                encoding="utf-8",
+            )
+            character = root / "character.png"
+            Image.new("RGB", (720, 1280), "blue").save(character)
+            prepare_args = self.make_prepare_args(
+                root, source, prompt, segment_plan
+            )
+            prepare_args.character_image = character
+            prepare_args.character_image_type = "virtual"
+            prepare_args.confirm_virtual_portrait_rights = True
+            with mock.patch.object(
+                MODULE, "probe_video", return_value=self.metadata(has_audio=False)
+            ):
+                plan_path = MODULE.prepare(prepare_args)
+
+            class FakePublisher:
+                def upload(
+                    self, _: Path, __: str, asset_id: str
+                ) -> dict[str, object]:
+                    return {
+                        "object_key": asset_id,
+                        "url": f"https://tos.example.com/{asset_id}",
+                        "url_expires_at": 2**31 - 1,
+                    }
+
+                def sign(self, object_key: str) -> dict[str, object]:
+                    return {
+                        "object_key": object_key,
+                        "url": f"https://tos.example.com/{object_key}",
+                        "url_expires_at": 2**31 - 1,
+                    }
+
+            class FakeAssetLibrary:
+                def create_group(self, _: str, __: str) -> str:
+                    return "group-private"
+
+                def create_asset(self, _: str, __: str, ___: str) -> str:
+                    return "asset-private"
+
+                def get_asset(self, _: str) -> dict[str, str]:
+                    return {"Status": "Active", "ProjectName": "default"}
+
+            tasks = FakeTasks()
+            client = SimpleNamespace(content_generation=SimpleNamespace(tasks=tasks))
+            submit_args = SimpleNamespace(
+                plan=plan_path,
+                ark_api_key_file=None,
+                tos_config_file=None,
+                poll_interval=0.0,
+                poll_timeout=5.0,
+                signed_url_ttl=3600,
+                retry_failed=False,
+                allow_recreate_ambiguous=False,
+                asset_project_name="default",
+                asset_poll_interval=0.0,
+                asset_poll_timeout=5.0,
+            )
+
+            def fake_download(_: str, destination: Path, attempts: int = 3) -> None:
+                del attempts
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"generated")
+
+            def fake_concat(
+                parts: list[Path],
+                destination: Path,
+                expected_duration: int,
+                expect_audio: bool,
+            ) -> Path:
+                del expected_duration, expect_audio
+                destination.write_bytes(parts[0].read_bytes())
+                return destination
+
+            with (
+                mock.patch.dict(os.environ, {"ARK_API_KEY": "ark-test-key-value"}),
+                mock.patch.object(
+                    MODULE,
+                    "load_tos_config",
+                    return_value={
+                        "access_key": "ak",
+                        "secret_key": "sk",
+                        "region": "cn-beijing",
+                    },
+                ),
+                mock.patch.object(MODULE, "download_video", side_effect=fake_download),
+                mock.patch.object(MODULE, "validate_generated_video"),
+                mock.patch.object(
+                    MODULE, "concat_generated_videos", side_effect=fake_concat
+                ),
+            ):
+                MODULE.submit(
+                    submit_args,
+                    client_factory=lambda _: client,
+                    publisher_factory=lambda _config, _ttl: FakePublisher(),
+                    asset_library_factory=lambda _config, _project: FakeAssetLibrary(),
+                )
+
+            request = json.loads(
+                (plan_path.parent / "responses" / "request_part_01.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            image_item = next(
+                item for item in request["content"] if item["type"] == "image_url"
+            )
+            self.assertEqual(
+                image_item["image_url"]["url"], "asset://asset-private"
+            )
 
     def test_submit_creates_all_segments_before_parallel_polling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
