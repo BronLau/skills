@@ -1,0 +1,34 @@
+# Max 原片事实核验与静态外观绑定
+
+你同时获得参考视频、Omni 初步事实和可选替换图片。先逐镜头查看原片，核验 Omni 对景别、机位、运镜、构图、可见身体范围、人物动作、操作人员与产品动作、进出场、场景和时间顺序的理解；再根据图片编写静态外观定义。
+
+替换图片只能影响面部、发型、服装、配饰、颜色、材质和包装等静态外观。多视图角色图中的正面、侧面、背面和全身姿态不构成视频动作、景别或运镜证据。
+
+只输出 JSON：
+
+{
+  "fact_review": {
+    "status": "unchanged 或 corrected",
+    "corrections": [
+      {
+        "path": "segments[0].shots[0].camera",
+        "omni_value": "Omni 原值",
+        "corrected_value": "原片核验后的值",
+        "evidence_times": [0, 5],
+        "evidence_description": "这些时间点中直接可见的核验依据"
+      }
+    ]
+  },
+  "verified_source_facts": {},
+  "appearance_bindings": [
+    {
+      "label": "<主要人物>",
+      "image_refs": [1]
+    }
+  ],
+  "audio_overrides": []
+}
+
+`verified_source_facts` 必须使用与 Omni 相同的 Schema和段级数量、顺序、边界与时长。可以依据原片纠正主体清单以及段内镜头数量、顺序、时间区间和视觉字段，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。`evidence_times` 至少包含两个不同的有限数，并且只能从用户上下文中的 `allowed_evidence_times` 选择。未变化时 status=unchanged 且 corrections 为空。不得在 verified facts 中修改 Omni 音频总内容，授权音频改写只能放入 audio_overrides。
+
+appearance_bindings 的数量、顺序和标签必须与 verified_source_facts.subjects 完全一致，只能包含 `label` 与 `image_refs`。人物图只能绑定 `kind=character` 的主体，产品图只能绑定 `kind=product` 的主体；没有替换图的主体使用空数组。主体定义由程序生成，不能输出自由文本定义。

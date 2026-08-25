@@ -65,9 +65,30 @@ class SeedancePipelineTests(unittest.TestCase):
         prompt: Path,
         plan: Path,
     ) -> SimpleNamespace:
+        omni_facts = root / "omni_facts.json"
+        verification = root / "max_verification.json"
+        omni_facts.write_text("{}\n", encoding="utf-8")
+        verification.write_text("{}\n", encoding="utf-8")
+        fact_lock = root / "fact_lock.json"
+        fact_lock.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "status": "locked",
+                    "assembly_mode": "deterministic_from_max_verified_facts",
+                    "prompt_sha256": MODULE.prompt_text_sha256(prompt),
+                    "segment_plan_sha256": MODULE.file_sha256(plan),
+                    "analysis_video": MODULE.file_identity(source),
+                    "omni_facts": MODULE.file_identity(omni_facts),
+                    "max_verification": MODULE.file_identity(verification),
+                }
+            ),
+            encoding="utf-8",
+        )
         return SimpleNamespace(
             prompt=prompt,
             segment_plan=plan,
+            fact_lock=fact_lock,
             source_video=source,
             depth_dir=None,
             character_image=None,
@@ -817,6 +838,37 @@ class SeedancePipelineTests(unittest.TestCase):
                 "ark-key-value-123456",
             )
 
+    def test_split_directory_routes_credentials_by_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "TOS_Config.md").write_text(
+                "endpoint: [tos-cn-beijing.volces.com]  region: cn-beijing  "
+                "accessKey: old-ak  secretKey: old-sk  bucket: test-bucket  "
+                "roleTrn: trn:iam::1:role/tos-put  "
+                "publicDomain: https://tos.example.com/  "
+                "mainPath: authorized/prod\n",
+                encoding="utf-8",
+            )
+            (root / "Volcengine_API_KEY.md").write_text(
+                "**accessKey**： new-ak\n**secretKey**： new-sk\n",
+                encoding="utf-8",
+            )
+
+            config = MODULE.load_tos_config(root)
+
+            self.assertEqual(config["access_key"], "old-ak")
+            self.assertEqual(config["secret_key"], "old-sk")
+            self.assertEqual(config["asset_access_key"], "new-ak")
+            self.assertEqual(config["asset_secret_key"], "new-sk")
+            self.assertEqual(config["endpoint"], "tos-cn-beijing.volces.com")
+            self.assertEqual(config["bucket"], "test-bucket")
+            self.assertEqual(
+                config["prefix"], "authorized/prod/video-white-model-prompt"
+            )
+            asset_config = MODULE.ark_asset_config(config)
+            self.assertEqual(asset_config["access_key"], "new-ak")
+            self.assertEqual(asset_config["secret_key"], "new-sk")
+
     def test_tos_publisher_assumes_role_and_returns_public_tos_url(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "asset image.png"
@@ -1130,6 +1182,9 @@ class SeedancePipelineTests(unittest.TestCase):
                 ),
             ):
                 MODULE.submit(submit_args, client_factory=lambda _: client)
+                legacy_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                legacy_plan.pop("fact_lock")
+                plan_path.write_text(json.dumps(legacy_plan), encoding="utf-8")
                 MODULE.submit(submit_args, client_factory=lambda _: client)
 
             self.assertEqual(tasks.create_count, 1)

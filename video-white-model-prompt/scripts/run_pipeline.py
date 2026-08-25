@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -36,9 +37,8 @@ __all__ = [
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEPTH_SCRIPT = SKILL_DIR / "scripts" / "depth_video_pipeline.py"
-QWEN_SCRIPT = SKILL_DIR / "scripts" / "qwen_video_prompt_reverse.py"
+QWEN_SCRIPT = SKILL_DIR / "scripts" / "verified_video_prompt_reverse.py"
 SEEDANCE_SCRIPT = SKILL_DIR / "scripts" / "seedance_video_pipeline.py"
-SYSTEM_PROMPT = SKILL_DIR / "prompts" / "video_reverse_system_prompt.txt"
 MODEL_NAME = "depth_anything_v2_vits.onnx"
 LOCAL_MODEL_FALLBACK = Path("~/Documents/CodeX/Video/models") / MODEL_NAME
 
@@ -312,6 +312,10 @@ def archive_depth_outputs(output_dir: Path, video: Path) -> None:
 def validate_completed_outputs(
     prompt_path: Path,
     plan_path: Path,
+    omni_facts_path: Path,
+    verification_path: Path,
+    fact_lock_path: Path,
+    analysis_video: Path,
     depth_files: list[Path],
     depth_required: bool = True,
 ) -> None:
@@ -319,6 +323,14 @@ def validate_completed_outputs(
         raise PipelineError("完成标记存在，但正式提示词缺失或为空。")
     if not plan_path.is_file():
         raise PipelineError("完成标记存在，但分段计划缺失。")
+    validate_fact_lock(
+        fact_lock_path,
+        prompt_path,
+        plan_path,
+        omni_facts_path,
+        verification_path,
+        analysis_video,
+    )
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         expected_count = len(plan["segments"])
@@ -335,11 +347,96 @@ def validate_completed_outputs(
         raise PipelineError("完成标记存在，但白模文件为空。")
 
 
+def prompt_text_sha256(path: Path) -> str:
+    return hashlib.sha256(
+        path.read_text(encoding="utf-8").strip().encode("utf-8")
+    ).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_fact_lock(
+    lock_path: Path,
+    prompt_path: Path,
+    plan_path: Path,
+    omni_facts_path: Path,
+    verification_path: Path,
+    analysis_video: Path,
+) -> dict[str, object]:
+    if not lock_path.is_file():
+        raise PipelineError("缺少 Max 核验事实锁定记录。")
+    try:
+        body = json.loads(lock_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PipelineError("Max 核验事实锁定记录不是有效 JSON。") from exc
+    if body.get("status") != "locked" or body.get("assembly_mode") != (
+        "deterministic_from_max_verified_facts"
+    ):
+        raise PipelineError("Max 核验事实尚未锁定。")
+    checks = (
+        ("prompt_sha256", prompt_text_sha256(prompt_path), "正式提示词"),
+        ("segment_plan_sha256", file_sha256(plan_path), "分段计划"),
+    )
+    for key, actual, label in checks:
+        if body.get(key) != actual:
+            raise PipelineError(f"{label}已变化，事实锁定记录失效。")
+    identities = (
+        ("analysis_video", analysis_video, "分析视频"),
+        ("omni_facts", omni_facts_path, "Omni 初步事实"),
+        ("max_verification", verification_path, "Max 核验事实"),
+    )
+    for key, path, label in identities:
+        identity = body.get(key)
+        if not isinstance(identity, dict) or identity.get("sha256") != file_sha256(path):
+            raise PipelineError(f"{label}已变化，事实锁定记录失效。")
+    return body
+
+
+def fact_lock_complete(
+    lock_path: Path,
+    prompt_path: Path,
+    plan_path: Path,
+    omni_facts_path: Path,
+    verification_path: Path,
+    analysis_video: Path,
+) -> bool:
+    if not all(
+        path.is_file()
+        for path in (
+            lock_path,
+            prompt_path,
+            plan_path,
+            omni_facts_path,
+            verification_path,
+        )
+    ):
+        return False
+    try:
+        validate_fact_lock(
+            lock_path,
+            prompt_path,
+            plan_path,
+            omni_facts_path,
+            verification_path,
+            analysis_video,
+        )
+    except PipelineError:
+        return False
+    return True
+
+
 def build_seedance_prepare_command(
     args: argparse.Namespace,
     video: Path,
     prompt_path: Path,
     plan_path: Path,
+    fact_lock_path: Path,
     output_dir: Path,
     character_image: Path | None,
     product_images: list[Path],
@@ -354,6 +451,8 @@ def build_seedance_prepare_command(
         str(prompt_path),
         "--segment-plan",
         str(plan_path),
+        "--fact-lock",
+        str(fact_lock_path),
         "--source-video",
         str(video),
         "--output-dir",
@@ -548,13 +647,14 @@ def main() -> int:
             )
             return 0
 
-        require_file(SYSTEM_PROMPT, "Qwen 系统提示词")
         draft_path = output_dir / "prompt_draft.txt"
-        draft_candidate_path = output_dir / "prompt_draft_candidate.txt"
-        draft_meta_path = output_dir / "prompt_draft_meta.json"
+        omni_facts_path = output_dir / "omni_facts.json"
+        omni_meta_path = output_dir / "omni_facts_meta.json"
+        verification_path = output_dir / "max_verification.json"
         candidate_path = output_dir / "prompt_candidate.txt"
         prompt_path = output_dir / "prompt.txt"
         plan_path = output_dir / "segment_plan.json"
+        fact_lock_path = output_dir / "fact_lock.json"
         work_dir = output_dir / ".depth_work"
         current_depth_outputs = (
             depth_outputs(output_dir / "depth", video) if with_depth else []
@@ -562,12 +662,23 @@ def main() -> int:
         ready_path = output_dir / "ready_for_seedance.json"
         seedance_plan_path = output_dir / "seedance" / "seedance_plan.json"
 
-        prompt_complete = prompt_path.is_file() and plan_path.is_file()
+        prompt_complete = fact_lock_complete(
+            fact_lock_path,
+            prompt_path,
+            plan_path,
+            omni_facts_path,
+            verification_path,
+            analysis_video,
+        )
         cache_complete = with_depth and depth_cache_complete(work_dir)
         if args.resume and ready_path.is_file():
             validate_completed_outputs(
                 prompt_path,
                 plan_path,
+                omni_facts_path,
+                verification_path,
+                fact_lock_path,
+                analysis_video,
                 current_depth_outputs,
                 depth_required=with_depth,
             )
@@ -586,39 +697,36 @@ def main() -> int:
                 str(QWEN_SCRIPT),
                 "--video",
                 str(analysis_video),
-                "--system-prompt",
-                str(SYSTEM_PROMPT),
                 "--segment-max-seconds",
                 str(args.segment_max_seconds),
+                "--omni-facts-output",
+                str(omni_facts_path),
+                "--omni-metadata-output",
+                str(omni_meta_path),
+                "--draft-output",
+                str(draft_path),
+                "--verification-output",
+                str(verification_path),
                 "--output",
                 str(prompt_path),
                 "--candidate-output",
                 str(candidate_path),
                 "--segment-plan-output",
                 str(plan_path),
+                "--fact-lock-output",
+                str(fact_lock_path),
                 "--max-inline-request-mb",
                 str(args.max_inline_request_mb),
                 "--max-tokens",
                 str(args.max_tokens),
             ]
-            if draft_path.is_file() and draft_meta_path.is_file():
+            if omni_facts_path.is_file() and omni_meta_path.is_file():
                 qwen_command.extend(
                     [
-                        "--draft-file",
-                        str(draft_path),
-                        "--draft-metadata-file",
-                        str(draft_meta_path),
-                    ]
-                )
-            else:
-                qwen_command.extend(
-                    [
-                        "--draft-output",
-                        str(draft_path),
-                        "--draft-candidate-output",
-                        str(draft_candidate_path),
-                        "--draft-metadata-output",
-                        str(draft_meta_path),
+                        "--omni-facts-file",
+                        str(omni_facts_path),
+                        "--omni-metadata-file",
+                        str(omni_meta_path),
                     ]
                 )
             if args.resume:
@@ -644,9 +752,9 @@ def main() -> int:
             if args.save_debug:
                 qwen_command.extend(
                     [
-                        "--request-body-output",
+                        "--max-request-body-output",
                         str(output_dir / "max_request.json"),
-                        "--response-body-output",
+                        "--max-response-body-output",
                         str(output_dir / "max_response.json"),
                         "--omni-request-body-output",
                         str(output_dir / "omni_request.json"),
@@ -697,6 +805,16 @@ def main() -> int:
             flush=True,
         )
 
+        if qwen_code == 0:
+            validate_fact_lock(
+                fact_lock_path,
+                prompt_path,
+                plan_path,
+                omni_facts_path,
+                verification_path,
+                analysis_video,
+            )
+
         encode_code: int | None = 0 if not with_depth else None
         if with_depth and depth_code == 0 and qwen_code == 0 and plan_path.is_file():
             depth_dir = output_dir / "depth"
@@ -725,6 +843,7 @@ def main() -> int:
                 video,
                 prompt_path,
                 plan_path,
+                fact_lock_path,
                 output_dir,
                 character_image,
                 product_images,

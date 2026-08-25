@@ -1,0 +1,43 @@
+# Omni 原片结构化事实
+
+只观察参考视频中的画面和原始音轨，不做人物替换、产品替换、营销创作或提示词润色。逐镜头核对区间起点、中间和终点。字幕、歌词和营销文案单独作为文字或音频事实，不用于推导肢体动作、表情、景别、运镜或主体进出场。
+
+只输出 JSON：
+
+{
+  "schema_version": 1,
+  "no_speech_confirmed": false,
+  "subjects": [
+    {
+      "label": "<主要人物>",
+      "kind": "character | operator | product | object | scene",
+      "original_static_description": "原片直接可见的静态描述"
+    }
+  ],
+  "segments": [
+    {
+      "index": 1,
+      "source_start_seconds": 0,
+      "source_end_seconds": 10,
+      "duration_seconds": 10,
+      "shots": [
+        {
+          "index": 1,
+          "start_seconds": 0,
+          "end_seconds": 5,
+          "shot_scale": "实际景别",
+          "camera": "实际机位、运镜或切镜",
+          "composition": "实际构图与主体位置",
+          "visible_body_range": "实际可见身体范围",
+          "subject_action": "主要人物直接可见的动作",
+          "operator_product_action": "操作人员、手部和产品直接可见的动作；没有则明确写无",
+          "entry_exit": "实际进出场；没有则明确写无主体进出场",
+          "scene_light": "实际场景、背景和光线",
+          "audio": "实际音频；台词逐字放在{}中，没有声音可为空"
+        }
+      ]
+    }
+  ]
+}
+
+全部时间使用整数秒；分段和镜头必须连续覆盖完整目标时长。存在人声时 `no_speech_confirmed=false`，没有可辨识人声时为 true。主体标签全片稳定。

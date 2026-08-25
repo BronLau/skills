@@ -1064,7 +1064,7 @@ API_CONTROL_LITERAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DEFINITION_LINE_PATTERN = re.compile(
-    r"^(?:参考@图片\d+中的.+，将其定义为<[^<>]+>|将.+定义为<[^<>]+>)[。.]?$"
+    r"^(?:参考@图片\d+中(?:的)?.+，将其定义为<[^<>]+>|将.+定义为<[^<>]+>)[。.]?$"
 )
 
 

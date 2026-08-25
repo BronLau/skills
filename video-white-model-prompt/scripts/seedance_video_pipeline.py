@@ -108,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--prompt", type=Path, required=True)
     prepare.add_argument("--segment-plan", type=Path, required=True)
+    prepare.add_argument("--fact-lock", type=Path, required=True)
     prepare.add_argument("--source-video", type=Path, required=True)
     prepare.add_argument("--depth-dir", type=Path)
     prepare.add_argument("--character-image", type=Path)
@@ -340,6 +341,38 @@ def validate_identity(identity: dict[str, Any], label: str) -> Path:
     if actual != identity:
         raise SeedanceError(f"{label}在计划生成后发生变化，拒绝继续：{path}")
     return path
+
+
+def prompt_text_sha256(path: Path) -> str:
+    return hashlib.sha256(
+        path.read_text(encoding="utf-8").strip().encode("utf-8")
+    ).hexdigest()
+
+
+def validate_fact_lock_file(
+    lock_path: Path,
+    prompt_path: Path,
+    segment_plan_path: Path,
+) -> dict[str, Any]:
+    body = load_json(lock_path, "Max 核验事实锁定记录")
+    if body.get("status") != "locked" or body.get("assembly_mode") != (
+        "deterministic_from_max_verified_facts"
+    ):
+        raise SeedanceError("Max 核验事实尚未锁定，拒绝准备或提交 Seedance。")
+    if body.get("prompt_sha256") != prompt_text_sha256(prompt_path):
+        raise SeedanceError("正式提示词已变化，事实锁定记录失效。")
+    if body.get("segment_plan_sha256") != file_sha256(segment_plan_path):
+        raise SeedanceError("分段计划已变化，事实锁定记录失效。")
+    for key, label in (
+        ("analysis_video", "分析视频"),
+        ("omni_facts", "Omni 初步事实"),
+        ("max_verification", "Max 核验事实"),
+    ):
+        identity = body.get(key)
+        if not isinstance(identity, dict):
+            raise SeedanceError(f"事实锁定记录缺少 {key}。")
+        validate_identity(identity, label)
+    return body
 
 
 def atomic_write_json(path: Path, body: dict[str, Any]) -> None:
@@ -652,6 +685,8 @@ def compile_prompt(body: str, image_count: int, with_depth: bool) -> str:
 def prepare(args: argparse.Namespace) -> Path:
     prompt_path = require_file(args.prompt, "最终提示词")
     plan_path = require_file(args.segment_plan, "分段计划")
+    lock_path = require_file(args.fact_lock, "Max 核验事实锁定记录")
+    validate_fact_lock_file(lock_path, prompt_path, plan_path)
     source_video = require_file(args.source_video, "原始参考视频")
     character_image = (
         require_file(args.character_image, "人物形象图")
@@ -766,7 +801,7 @@ def prepare(args: argparse.Namespace) -> Path:
         )
 
     plan_body = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "prepared",
         "run_id": uuid.uuid4().hex,
         "model": model_id,
@@ -774,6 +809,7 @@ def prepare(args: argparse.Namespace) -> Path:
         "mode": "depth-reference" if depth_files else "text-and-image-reference",
         "source_video": file_identity(source_video),
         "prompt": file_identity(prompt_path),
+        "fact_lock": file_identity(lock_path),
         "segment_plan": file_identity(plan_path),
         "images": image_assets,
         "character_reference": (
@@ -836,11 +872,38 @@ def resolve_ark_api_key(path: Path | None) -> str:
 
 
 def markdown_tos_value(content: str, name: str) -> str:
+    label = (
+        rf"(?<![A-Za-z0-9_])(?:\*\*)?{re.escape(name)}(?:\*\*)?"
+        r"\s*[:=：]\s*"
+    )
     if name == "endpoint":
-        match = re.search(r"\bendpoint:\s*\[([^\]]+)\]", content)
+        match = re.search(label + r"\[([^\]]+)\]", content)
     else:
-        match = re.search(rf"\b{re.escape(name)}:\s*([^\s]+)", content)
-    return match.group(1).strip().strip("`\"'") if match else ""
+        match = re.search(label + r"[`\"']?([^\s`\"']+)", content)
+    return match.group(1).strip().strip("`\"'*") if match else ""
+
+
+def read_tos_config_file(path: Path, label: str) -> dict[str, str]:
+    content = require_file(path, label).read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        parsed = {
+            name: markdown_tos_value(content, name)
+            for name in (
+                "endpoint",
+                "region",
+                "accessKey",
+                "secretKey",
+                "bucket",
+                "roleTrn",
+                "publicDomain",
+                "mainPath",
+            )
+        }
+    if not isinstance(parsed, dict):
+        raise SeedanceError(f"{label}根节点必须是对象。")
+    return normalize_tos_config(parsed)
 
 
 def normalize_tos_config(body: dict[str, Any]) -> dict[str, str]:
@@ -873,30 +936,24 @@ def load_tos_config(
     config: dict[str, str] = {}
     if path:
         resolved = path.expanduser().resolve()
+        credentials_file: Path | None = None
         if resolved.is_dir():
-            resolved = resolved / "Volc engine_API_KEY.md"
-        content = require_file(resolved, "火山 TOS 配置文件").read_text(
-            encoding="utf-8"
-        )
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            parsed = {
-                name: markdown_tos_value(content, name)
-                for name in (
-                    "endpoint",
-                    "region",
-                    "accessKey",
-                    "secretKey",
-                    "bucket",
-                    "roleTrn",
-                    "publicDomain",
-                    "mainPath",
-                )
-            }
-        if not isinstance(parsed, dict):
-            raise SeedanceError("火山 TOS 配置根节点必须是对象。")
-        config.update(normalize_tos_config(parsed))
+            legacy_file = resolved / "Volc engine_API_KEY.md"
+            if legacy_file.is_file():
+                resolved = legacy_file
+            else:
+                credentials_file = resolved / "Volcengine_API_KEY.md"
+                resolved = resolved / "TOS_Config.md"
+        config.update(read_tos_config_file(resolved, "火山 TOS 配置文件"))
+        if credentials_file and credentials_file.is_file():
+            credentials = read_tos_config_file(
+                credentials_file,
+                "Ark 人物 Asset AK/SK 配置文件",
+            )
+            if credentials.get("access_key"):
+                config["asset_access_key"] = credentials["access_key"]
+            if credentials.get("secret_key"):
+                config["asset_secret_key"] = credentials["secret_key"]
     environment_mapping = {
         "access_key": "TOS_ACCESS_KEY",
         "secret_key": "TOS_SECRET_KEY",
@@ -931,6 +988,15 @@ def load_tos_config(
     if require_storage and config.get("public_domain"):
         config["public_domain"] = config["public_domain"].rstrip("/")
     return config
+
+
+def ark_asset_config(config: dict[str, str]) -> dict[str, str]:
+    asset_config = dict(config)
+    if config.get("asset_access_key"):
+        asset_config["access_key"] = config["asset_access_key"]
+    if config.get("asset_secret_key"):
+        asset_config["secret_key"] = config["asset_secret_key"]
+    return asset_config
 
 
 class TosPublisher:
@@ -1706,8 +1772,37 @@ def submit(
         raise SeedanceError("Seedance 计划状态无效。")
     character_reference = validate_character_reference_plan(plan)
     validate_identity(plan["source_video"], "原始参考视频")
-    validate_identity(plan["prompt"], "最终提示词")
+    prompt_path = validate_identity(plan["prompt"], "最终提示词")
     segment_plan_path = validate_identity(plan["segment_plan"], "分段计划")
+    state_path = plan_path.with_name("tasks.json")
+    preexisting_state: dict[str, Any] | None = None
+    legacy_query_only = False
+    if isinstance(plan.get("fact_lock"), dict):
+        lock_path = validate_identity(plan["fact_lock"], "Max 核验事实锁定记录")
+        validate_fact_lock_file(lock_path, prompt_path, segment_plan_path)
+    else:
+        if not state_path.is_file():
+            raise SeedanceError("Seedance 计划缺少 Max 核验事实锁定记录。")
+        preexisting_state = load_json(state_path, "Seedance 任务状态")
+        if preexisting_state.get("run_id") != plan.get("run_id"):
+            raise SeedanceError("Seedance 任务状态不属于当前计划。")
+        missing_task_ids = [
+            int(segment["index"])
+            for segment in plan.get("segments") or []
+            if not str(
+                (preexisting_state.get("segments") or {})
+                .get(str(segment["index"]), {})
+                .get("task_id")
+                or ""
+            )
+        ]
+        if missing_task_ids:
+            raise SeedanceError(
+                "旧计划没有 Max 核验事实锁，只允许查询已有任务；"
+                f"以下分段缺少 task_id：{missing_task_ids}"
+            )
+        legacy_query_only = True
+        print("SEEDANCE legacy_plan_query_only", flush=True)
     segment_plan = load_json(segment_plan_path, "分段计划")
     validate_segment_plan(segment_plan)
     segment_max_seconds = int(segment_plan["segment_max_seconds"])
@@ -1728,10 +1823,12 @@ def submit(
             validate_identity(segment["depth_video"], f"第 {segment['index']} 段白模")
 
     api_key = resolve_ark_api_key(args.ark_api_key_file)
-    requires_storage = plan_requires_storage(plan, character_reference)
+    requires_storage = (
+        False if legacy_query_only else plan_requires_storage(plan, character_reference)
+    )
     tos_config = (
         load_tos_config(args.tos_config_file, require_storage=requires_storage)
-        if requires_storage or character_reference is not None
+        if requires_storage or (character_reference is not None and not legacy_query_only)
         else None
     )
     if client_factory is None:
@@ -1756,8 +1853,9 @@ def submit(
         publisher_builder = publisher_factory or TosPublisher
         publisher = publisher_builder(tos_config, args.signed_url_ttl)
 
-    state_path = plan_path.with_name("tasks.json")
-    if state_path.exists():
+    if preexisting_state is not None:
+        state = preexisting_state
+    elif state_path.exists():
         state = load_json(state_path, "Seedance 任务状态")
         if state.get("run_id") != plan["run_id"]:
             raise SeedanceError("Seedance 任务状态不属于当前计划。")
@@ -1775,11 +1873,14 @@ def submit(
         str(getattr(args, "asset_project_name", "default") or "default").strip()
         or "default"
     )
-    if isinstance(character_reference, dict):
+    if isinstance(character_reference, dict) and not legacy_query_only:
         if tos_config is None:
             raise SeedanceError("人物 Asset 校验或创建缺少火山 AK/SK 配置。")
         asset_library_builder = asset_library_factory or ArkAssetLibrary
-        asset_library = asset_library_builder(tos_config, project_name)
+        asset_library = asset_library_builder(
+            ark_asset_config(tos_config),
+            project_name,
+        )
 
     def asset_url(asset_id: str, identity: dict[str, Any]) -> str:
         if publisher is None:
@@ -1799,7 +1900,7 @@ def submit(
         return str(upload["url"])
 
     image_urls: list[str] = []
-    for asset in plan.get("images") or []:
+    for asset in [] if legacy_query_only else (plan.get("images") or []):
         if (
             asset.get("reference_role") == "character"
             and isinstance(character_reference, dict)

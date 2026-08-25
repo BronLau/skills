@@ -324,8 +324,9 @@ class ResumePipelineTests(unittest.TestCase):
             video = root / "input.mp4"
             prompt = root / "prompt.txt"
             plan = root / "segment_plan.json"
+            fact_lock = root / "fact_lock.json"
             character = root / "character.png"
-            for path in (video, prompt, plan, character):
+            for path in (video, prompt, plan, fact_lock, character):
                 path.write_bytes(b"data")
             args = self.make_args(root, video)
             args.character_image = character
@@ -337,6 +338,7 @@ class ResumePipelineTests(unittest.TestCase):
                 video,
                 prompt,
                 plan,
+                fact_lock,
                 root / "output",
                 character,
                 [],
@@ -369,7 +371,10 @@ class ResumePipelineTests(unittest.TestCase):
                             encoding="utf-8",
                         )
                         self.command_value(
-                            command, "--draft-metadata-output"
+                            command, "--omni-facts-output"
+                        ).write_text("{}\n", encoding="utf-8")
+                        self.command_value(
+                            command, "--omni-metadata-output"
                         ).write_text("{}\n", encoding="utf-8")
 
                     return FakeProcess(1, write_draft)
@@ -416,20 +421,42 @@ class ResumePipelineTests(unittest.TestCase):
 
             def resume_popen(command: list[str]):
                 resume_commands.append(command)
-                self.assertIn("--draft-file", command)
+                self.assertIn("--omni-facts-file", command)
                 self.assertIn("--overwrite", command)
 
                 def write_final_prompt():
-                    self.command_value(command, "--output").write_text(
+                    omni_path = self.command_value(command, "--omni-facts-output")
+                    verification_path = self.command_value(command, "--verification-output")
+                    omni_path.write_text("{}\n", encoding="utf-8")
+                    verification_path.write_text("{}\n", encoding="utf-8")
+                    prompt_path = self.command_value(command, "--output")
+                    prompt_path.write_text(
                         "镜头1[00:00-00:05] 最终稿",
                         encoding="utf-8",
                     )
-                    self.command_value(command, "--segment-plan-output").write_text(
+                    plan_path = self.command_value(command, "--segment-plan-output")
+                    plan_path.write_text(
                         json.dumps(
                             {
                                 "segment_max_seconds": 15,
                                 "segments": [{"index": 1, "duration_seconds": 5}],
                                 "split_times_seconds": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    self.command_value(command, "--fact-lock-output").write_text(
+                        json.dumps(
+                            {
+                                "status": "locked",
+                                "assembly_mode": "deterministic_from_max_verified_facts",
+                                "prompt_sha256": MODULE.prompt_text_sha256(prompt_path),
+                                "segment_plan_sha256": MODULE.file_sha256(plan_path),
+                                "analysis_video": {"sha256": MODULE.file_sha256(video)},
+                                "omni_facts": {"sha256": MODULE.file_sha256(omni_path)},
+                                "max_verification": {
+                                    "sha256": MODULE.file_sha256(verification_path)
+                                },
                             }
                         ),
                         encoding="utf-8",
@@ -514,17 +541,45 @@ class ResumePipelineTests(unittest.TestCase):
                 self.assertEqual(command[replacement_index + 1], "旧产品=收腹裤")
 
                 def write_prompt_outputs():
-                    self.command_value(command, "--output").write_text(
+                    omni_path = self.command_value(command, "--omni-facts-output")
+                    verification_path = self.command_value(command, "--verification-output")
+                    omni_path.write_text("{}\n", encoding="utf-8")
+                    self.command_value(command, "--omni-metadata-output").write_text(
+                        "{}\n", encoding="utf-8"
+                    )
+                    self.command_value(command, "--draft-output").write_text(
+                        "镜头1[00:00-00:10] 初稿", encoding="utf-8"
+                    )
+                    verification_path.write_text("{}\n", encoding="utf-8")
+                    prompt_path = self.command_value(command, "--output")
+                    prompt_path.write_text(
                         "镜头1[00:00-00:10] 最终稿",
                         encoding="utf-8",
                     )
-                    self.command_value(command, "--segment-plan-output").write_text(
+                    plan_path = self.command_value(command, "--segment-plan-output")
+                    plan_path.write_text(
                         json.dumps(
                             {
                                 "segment_max_seconds": 15,
                                 "prompt_duration_seconds": 10,
                                 "segments": [{"index": 1, "duration_seconds": 10}],
                                 "split_times_seconds": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    self.command_value(command, "--fact-lock-output").write_text(
+                        json.dumps(
+                            {
+                                "status": "locked",
+                                "assembly_mode": "deterministic_from_max_verified_facts",
+                                "prompt_sha256": MODULE.prompt_text_sha256(prompt_path),
+                                "segment_plan_sha256": MODULE.file_sha256(plan_path),
+                                "analysis_video": {"sha256": MODULE.file_sha256(video)},
+                                "omni_facts": {"sha256": MODULE.file_sha256(omni_path)},
+                                "max_verification": {
+                                    "sha256": MODULE.file_sha256(verification_path)
+                                },
                             }
                         ),
                         encoding="utf-8",

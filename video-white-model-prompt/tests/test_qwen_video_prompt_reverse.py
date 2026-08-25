@@ -545,6 +545,14 @@ class PipelinePromptTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ScriptError, "非主体定义内容"):
             MODULE.validate_prompt_contract(result, 10, 10.0, 15, 0, "测试稿")
 
+    def test_image_definition_accepts_zhong_with_or_without_de(self) -> None:
+        for line in (
+            "参考@图片1中具有黑色短发的女性，将其定义为<模特>。",
+            "参考@图片1中的具有黑色短发的女性，将其定义为<模特>。",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNotNone(MODULE.DEFINITION_LINE_PATTERN.fullmatch(line))
+
     def test_omni_without_spoken_content_requires_confirmation_marker(self) -> None:
         draft = "镜头1[00:00-00:10] 轻快 BGM。"
         with self.assertRaisesRegex(MODULE.AudioFactError, "无人声确认标记"):

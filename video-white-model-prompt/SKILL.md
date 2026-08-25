@@ -2,12 +2,12 @@
 name: video-white-model-prompt
 description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；人物图参考支持私域虚拟人像 Asset 或已授权真人 Asset。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
 metadata:
-  version: 1.11.1
+  version: 1.12.1
 ---
 
 # 视频白模、提示词反推与 Seedance 成片
 
-从唯一参考视频生成单目相对深度白模，或由 Qwen3.5-Omni-Plus 先生成视听初稿、Qwen3.8-Max 再精修为 Seedance 提示词，最后按用户选择带或不带白模参考生成分段成片。
+从唯一参考视频生成单目相对深度白模，或由 Qwen3.5-Omni-Plus 先提取结构化原片事实、Qwen3.8-Max 再对照原片核验事实并绑定替换外观，最后由程序确定性组装 Seedance 提示词，并按用户选择带或不带白模参考生成分段成片。
 
 ## 触发边界
 
@@ -87,7 +87,7 @@ Seedance 图片在提交前检查大小、像素和宽高比。人物形象图�
 
 启动 Qwen 或本地深度任务前，汇总输入、范围、分段上限、由分段上限确定的 Seedance 模型、图片、口播权限、Qwen Key 来源和默认 Seedance 参数。明确说明：
 
-- 分析视频、其中的原始音轨和图片会发送至阿里云 Qwen；有音轨时正常调用 Omni 与 Max 两次，无音轨时只调用 Max 一次。
+- 分析视频及其中的音轨会发送至 Omni，用于提取结构化原片事实；分析视频、Omni 事实和用户提供的图片会发送至 Max，用于对照原片纠正事实并绑定静态外观。正常流程调用 Omni 与 Max 各一次；任一阶段 JSON 或事实契约未通过时，该阶段最多定向修复一次。
 - 原始参考视频和原始音轨不会发送至 Seedance。
 - Seedance 每个最终分段对应一个独立生成任务；素材只在第二次确认后上传火山 TOS 和提交 Ark。
 - 虚拟人物图只在第二次确认后上传 TOS、创建或查询私域 Asset，并在状态为 `Active` 后用于 Seedance；真人肖像只查询用户提供的已授权 Asset ID。
@@ -132,15 +132,19 @@ python3 <skill-root>/scripts/run_pipeline.py \
   --output-dir <新目录>
 ```
 
-提示词链路和深度推理在带白模模式下并行运行。Omni 负责音频事实和安全分段点；Max 负责视觉、人物、产品和最终 Seedance 文案，但不得移动已合法锁定的 Omni 分段。
+提示词链路和深度推理在带白模模式下并行运行。Omni 只依据分析视频输出主体、分段、连续镜头时间轴、景别、机位、运镜、构图、可见身体范围、人物动作、操作人员与产品动作、进出场、场景光线和音频事实。Max 同时接收原片、Omni 事实和替换图片，对照原片核验每个视觉字段，并输出事实修正、核验后事实、静态外观绑定及按权限开放的音频覆盖。
 
-Omni 候选稿先校验音频事实：存在人声时必须使用 `{}` 完整记录；确实没有可辨识人声时必须输出唯一的 `[[NO_SPEECH_CONFIRMED]]` 内部标记。两者都没有或同时存在时由 Omni 定向修复一次。随后分两层校验结构。第一层校验可锁定的分段计划：分段标题可解析、数量最少、每段处于对应模型范围、总时长正确、参考视频区间连续；这一层失败时由 Omni 携带具体错误定向修复一次，仍失败则停止。第一层通过后锁定分段计划；若第二层的镜头编号、段内连续时间轴、图片编号或 API 参数字面量校验失败，保留该稿作为音频事实初稿，将错误和锁定分段布局交给原定的 Max 调用修复，不再次调用 Omni。
+Omni 结构化事实必须使用最少分段数，以整数秒连续覆盖完整目标时长；段内镜头编号和时间轴连续。存在人声时逐字写入 `{}`，没有可辨识人声时设置 `no_speech_confirmed=true`。人物图、产品图、名称、卖点和创意不发送给 Omni，避免替换素材污染原片动作理解。Omni JSON 不通过时携带具体错误定向修复一次，仍失败则停止。
 
-Max 终稿必须通过完整结构、锁定分段、实际图片编号和 API 字面量校验。Omni 结构合法时同时锁定镜头数量、顺序和时间区间；Max 只精修镜头内部内容。默认逐段保留 Omni 台词原文；指定词替换模式只允许明确的 `旧词=新词` 映射；只有用户明确允许整段改写时才关闭逐字一致性校验。产品名称、卖点和创意字段本身不改变口播权限。Max 只有可定位错误时携带具体错误定向修复一次，修复稿仍未通过则停止。只有全部终稿校验通过后，才提升正式提示词和分段计划。
+Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序、边界、时长和音频总内容；可以依据原片纠正主体清单、段内镜头数量、顺序、时间区间及视觉字段，但每类变化都必须在 `fact_review.corrections` 中逐项写明字段路径、完整 Omni 原值、完整修正值、证据时间和证据说明。证据时间至少包含两个不同的有限数，并且只能取程序预先提供的镜头或段级起点、中点、终点。任何未解释的事实变化、越权字段、NaN/Infinity 或无对应时间证据的修改都会被机器拒绝。
 
-Max 正式稿必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 参数，也不写视频编辑或延长意图。每段完成主体定义后直接进入 `镜头1[...]`；场景、风格、光线、节奏、情绪和声音信息写入实际发生的镜头，不输出“生成一条……”式段级整体概述。每段镜头1必须对应原片分段起点，段内镜头保持原片先后顺序。`seedance_video_pipeline.py prepare` 会拆出每段独立 Prompt；带白模模式直接以 `@视频1` 深度白模职责开头，不增加“生成一段全新视频”或“【参考素材职责】”；无白模模式不增加任何前缀或视频引用。
+人物图和产品图只进入结构化 `appearance_bindings`，每项只能包含主体标签和图片编号数组，不允许 Max 输出自由文本主体定义。人物图只能绑定 `kind=character`，产品图只能绑定 `kind=product`，每张图片只能绑定一个主体；最终主体定义由程序生成，因此替换素材不能通过定义文本夹带动作、姿态变化、景别、运镜、身体可见范围或进出场。
 
-第一阶段成功后写入 `ready_for_seedance.json` 和 `seedance/seedance_plan.json`，但不调用 Seedance。
+默认音频直接采用 Omni 事实；指定词替换由程序确定性执行；只有用户明确允许整段改写时，Max 才能通过 `audio_overrides` 修改对应镜头音频。最终 Prompt 由程序使用 Max 核验事实、静态外观绑定和授权音频覆盖确定性组装，Max 无法在组装阶段新增镜头动作。
+
+程序确定性组装的正式 Prompt 必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 参数，也不写视频编辑或延长意图。每段完成程序生成的主体定义后直接进入 `镜头1[...]`；场景、光线、主体状态和声音信息来自 Max 核验事实，不输出段级整体概述。每段镜头1对应原片分段起点，段内镜头沿用 Max 根据原片核验后的顺序。`seedance_video_pipeline.py prepare` 会拆出每段独立 Prompt；带白模模式直接以 `@视频1` 深度白模职责开头，无白模模式不增加任何视频引用。
+
+第一阶段成功后写入 `omni_facts.json`、`max_verification.json`、`fact_lock.json`、`ready_for_seedance.json` 和 `seedance/seedance_plan.json`，但不调用 Seedance。`fact_lock.json` 绑定分析视频、Omni 事实、Max 核验结果、正式 Prompt、分段计划、运行时 Prompt、模型与 FPS；任一产物变化时拒绝准备或提交 Seedance。
 
 ## 第二次确认与 Seedance 提交
 
@@ -150,7 +154,7 @@ Max 正式稿必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 
 - 带白模、产品图或需要创建新虚拟 Asset 时，火山 TOS 来源：`1. 使用已配置的 TOS 环境变量`、`2. 使用当前机器默认目录 /Users/bron/Documents/CodeX/API/火山`、`3. 提供配置文件或目录路径`、`4. 暂不提交并保留第一阶段产物`。只使用火山 TOS，不接入其他 OSS。仅查询已有人物 Asset 且没有其他上传素材时，仍从该配置读取 AK/SK 和区域，但不要求 Bucket 或 Endpoint。
 - 使用人物 Asset 时收集 `ProjectName`：`1. default`、`2. 指定其他项目名称`。Asset Group、Asset 和 Ark API Key 必须属于同一项目。
 
-完整展示正式提示词、Seedance 模型、任务数、每段时长、是否带白模、图片数量、人物类型、人物 Asset 创建或复用方式、`ProjectName`、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
+完整展示正式提示词、Max 事实修正摘要、Seedance 模型、任务数、每段时长、是否带白模、图片数量、人物类型、人物 Asset 创建或复用方式、`ProjectName`、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
 
 1. `确认并提交全部分段`
 2. `修改生成参数`
@@ -162,6 +166,7 @@ Max 正式稿必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 
 python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --prompt <输出目录>/prompt.txt \
   --segment-plan <输出目录>/segment_plan.json \
+  --fact-lock <输出目录>/fact_lock.json \
   --source-video <原片> \
   --depth-dir <带白模时传入> \
   --character-image <按原计划可选> \
@@ -188,7 +193,7 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py submit \
 
 只有用户针对人物 Asset 再次明确确认后，才追加 `--retry-failed-character-asset` 或 `--allow-recreate-ambiguous-character-asset`。这两个参数不由视频任务的 `--retry-failed` 或 `--allow-recreate-ambiguous` 代替。
 
-火山配置支持两种格式：JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段；或本机 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`。传目录时默认读取其中的 `Volc engine_API_KEY.md`。创建或上传素材需要完整 TOS 字段；只查询已有人物 Asset 时只要求 AK/SK 和区域。配置文件包含密钥，不作为交付物展示。
+火山配置支持两种格式：JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段；或本机 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`，字段可使用普通 Markdown、加粗标签、ASCII 冒号或全角冒号。传目录时优先兼容旧版单文件 `Volc engine_API_KEY.md`；旧文件不存在时，`TOS_Config.md` 中的 `accessKey`、`secretKey` 专用于 STS AssumeRole 与 TOS 上传，`Volcengine_API_KEY.md` 中的 `accessKey`、`secretKey` 专用于 Ark 人物 Asset API。创建或上传素材需要完整 TOS 字段；只查询已有人物 Asset 时只要求对应 Ark Asset AK/SK 和区域。配置文件包含密钥，不作为交付物展示。
 
 配置存在 `roleTrn` 时先通过 STS AssumeRole 获取临时写入凭证，所有对象必须写入 `mainPath/video-white-model-prompt/` 授权前缀；存在 `publicDomain` 时优先使用经过 URL 编码的公开 TOS 链接提交 Seedance，否则使用签名 URL。无白模且无图片时直接文生视频，不要求 TOS。原片和原始音轨在任何模式下都不上传 Seedance；声音仅由正式提示词和 `generate_audio` 控制。
 
@@ -202,7 +207,7 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py submit \
 
 ## 恢复与失败
 
-第一阶段恢复时复用原命令、原输入、原输出目录并增加 `--resume`。输入清单不一致时拒绝恢复；可复用正式 Omni 初稿、Max 正式稿、分段计划和完整深度缓存。
+第一阶段恢复时复用原命令、原输入、原输出目录并增加 `--resume`。输入清单不一致时拒绝恢复；可复用已验证的 `omni_facts.json`、Omni 元数据和完整深度缓存，重新执行 Max 原片核验与确定性组装。
 
 Seedance 使用 `seedance/tasks.json` 持久化上传对象、任务 ID 和状态：
 
@@ -212,11 +217,12 @@ Seedance 使用 `seedance/tasks.json` 持久化上传对象、任务 ID 和状�
 - 查询和结果下载可安全重试。下载文件未通过时长、音轨或可读性校验时，归档为 `.invalid_N`，并通过已有成功任务重新下载，不创建新任务。成功后立即保存到本地，因为远程结果 URL 会过期。
 - 人物 Asset 状态同时保存 `ProjectName`、Group ID、Asset ID、创建状态和最近查询状态。已有 Asset ID 时只调用 `GetAsset`；创建结果未知时标记 `create_ambiguous`，不自动重复创建素材组或素材。
 - 人物 Asset 的失败重试与未知创建结果处理使用独立确认参数，不继承视频任务的重试授权。
+- 1.12.0 之前已经创建任务 ID 的旧计划没有 `fact_lock` 时，只允许查询、下载和校验已有任务，不允许创建缺少任务 ID 的新分段。
 
 ## 交付
 
 - `仅白模`：按顺序展示 `depth/*.mp4`。
-- 成片模式：提供完整 `prompt.txt`、`segment_plan.json`；有音轨时同时提供 `prompt_draft.txt`。
+- 成片模式：提供完整 `prompt.txt`、`segment_plan.json`、`omni_facts.json`、`max_verification.json` 和 `fact_lock.json`；同时提供由 Omni 事实渲染的 `prompt_draft.txt`。
 - 提供各段 `seedance/generated/part_XX.<格式>`、完整成片 `seedance/generated/full.<格式>`、`seedance/seedance_plan.json` 和任务状态摘要。
 - 候选稿只用于失败排查，不作为正式提示词。
 - 每段正式提示词必须完整放入独立 `text` 代码块，不得省略。
