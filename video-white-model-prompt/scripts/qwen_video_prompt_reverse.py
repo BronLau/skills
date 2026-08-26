@@ -51,7 +51,9 @@ from media_preflight import (
     MediaPreflightError,
     build_compression_command as build_compression_command_shared,
     estimated_data_url_size,
+    seedance_image_limit,
     validate_image_input as validate_image_input_shared,
+    validate_seedance_image_count,
 )
 
 
@@ -176,7 +178,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         action="append",
         default=[],
-        help="可选产品图，可重复传入，最多 9 张。",
+        help=(
+            "可选产品图，可重复传入；与人物图合计时，15 秒分段最多 9 张，"
+            "30 秒分段最多 30 张。"
+        ),
     )
     parser.add_argument("--product-name", default="", help="可选产品名称。")
     parser.add_argument("--selling-points", default="", help="可选产品卖点。")
@@ -326,8 +331,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ScriptError("--fps 必须在 0.1 到 10 之间。")
     if args.duration_seconds is not None and args.duration_seconds <= 0:
         raise ScriptError("--duration-seconds 必须是正整数。")
-    if len(args.product_image) > 9:
-        raise ScriptError("--product-image 最多传入 9 次。")
+    try:
+        validate_seedance_image_count(
+            args.segment_max_seconds,
+            int(args.character_image is not None) + len(args.product_image),
+        )
+    except MediaPreflightError as exc:
+        raise ScriptError(str(exc)) from exc
     if len(args.user_idea) > 200:
         raise ScriptError("--user-idea 不能超过 200 字。")
     if args.max_tokens <= 0 or args.timeout <= 0 or args.retries <= 0:
@@ -569,6 +579,7 @@ def context_lines(
         if args.segment_max_seconds == 15
         else "Doubao Seedance 2.5"
     )
+    image_reference_limit = seedance_image_limit(args.segment_max_seconds)
     spoken_replacements = parse_spoken_replacements(args.spoken_replacement)
     if args.allow_audio_rewrite:
         audio_rewrite_permission = "用户已明确允许改写口播。"
@@ -598,6 +609,7 @@ def context_lines(
         f"duration_seconds：{duration_seconds}",
         f"segment_min_seconds：{MIN_SEGMENT_SECONDS}",
         f"segment_max_seconds：{args.segment_max_seconds}",
+        f"image_reference_limit：{image_reference_limit}",
         f"required_segment_count：{segment_count}",
         f"segment_output_contract：{segment_contract}",
         f"target_generator：{target_generator}",

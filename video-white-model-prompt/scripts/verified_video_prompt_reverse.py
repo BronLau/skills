@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from media_preflight import MediaPreflightError, validate_seedance_image_count
 from qwen_video_prompt_reverse import (
     DEFAULT_BASE_URL,
     DEFAULT_MAX_INLINE_REQUEST_MB,
@@ -745,7 +746,12 @@ def build_max_messages(
         number += 1
     replacements = parse_spoken_replacements(args.spoken_replacement)
     if args.allow_audio_rewrite:
-        audio_permission = "允许通过 audio_overrides 改写音频；视觉事实仍只按原片核验。"
+        audio_permission = (
+            "允许通过 audio_overrides 改写音频；视觉事实仍只按原片核验。"
+            "每项必须且只能使用 {\"segment_index\": JSON整数, "
+            "\"shot_index\": JSON整数, \"audio\": \"完整替换音频描述\"}，"
+            "并指向已存在的镜头，不得省略索引。"
+        )
     elif replacements:
         audio_permission = "audio_overrides 必须为空；程序将执行：" + "；".join(
             f"{source}→{target}" for source, target in replacements
@@ -824,8 +830,13 @@ def main() -> int:
             raise ScriptError("--fps 必须在 0.1 到 10 之间。")
         if args.allow_audio_rewrite and args.spoken_replacement:
             raise ScriptError("--allow-audio-rewrite 与 --spoken-replacement 不能同时使用。")
-        if len(args.product_image) > 9:
-            raise ScriptError("产品图最多 9 张。")
+        try:
+            validate_seedance_image_count(
+                args.segment_max_seconds,
+                int(args.character_image is not None) + len(args.product_image),
+            )
+        except MediaPreflightError as exc:
+            raise ScriptError(str(exc)) from exc
         api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
         if not api_key:
             if not args.api_key_file:
@@ -1042,6 +1053,8 @@ def main() -> int:
                         "content": (
                             f"机器校验失败：{error}\n重新查看原片，完整输出修复 JSON。"
                             "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
+                            "audio_overrides 非空时，每项必须且只能包含整数"
+                            " segment_index、整数 shot_index 和字符串 audio。"
                         ),
                     },
                 ],

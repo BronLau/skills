@@ -23,6 +23,14 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/gif",
 }
 SEEDANCE_MAX_IMAGE_BYTES = 30 * 1024 * 1024
+SEEDANCE_IMAGE_LIMIT_BY_SEGMENT_MAX_SECONDS = {
+    15: 9,
+    30: 30,
+}
+SEEDANCE_MODEL_LABEL_BY_SEGMENT_MAX_SECONDS = {
+    15: "Seedance 2.0",
+    30: "Seedance 2.5",
+}
 SAMPLE_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 SAMPLE_TIME_OFFSETS = (-0.08, 0.0, 0.08)
 
@@ -40,6 +48,33 @@ class VideoSignature(CompressionSignature):
     start_time: float
     width: int
     height: int
+
+
+def seedance_image_limit(segment_max_seconds: int) -> int:
+    try:
+        return SEEDANCE_IMAGE_LIMIT_BY_SEGMENT_MAX_SECONDS[segment_max_seconds]
+    except KeyError as exc:
+        raise MediaPreflightError(
+            "图片素材校验只支持 15 秒或 30 秒分段上限。"
+        ) from exc
+
+
+def validate_seedance_image_count(
+    segment_max_seconds: int,
+    image_count: int,
+) -> int:
+    if image_count < 0:
+        raise MediaPreflightError("图片类型素材总数不能为负数。")
+    limit = seedance_image_limit(segment_max_seconds)
+    if image_count > limit:
+        model_label = SEEDANCE_MODEL_LABEL_BY_SEGMENT_MAX_SECONDS[
+            segment_max_seconds
+        ]
+        raise MediaPreflightError(
+            f"{model_label} 图片类型素材总数不能超过 {limit} 张，"
+            f"当前为 {image_count} 张；人物图和产品图均计入总数。"
+        )
+    return limit
 
 
 def estimated_data_url_size(path: Path, mime_type: str | None = None) -> int:

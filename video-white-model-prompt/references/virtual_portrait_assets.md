@@ -4,23 +4,24 @@
 
 ## 路由
 
-- 虚拟人像：用户确认素材为虚拟形象且拥有完整权利后，可创建或复用私域虚拟人像 Asset。
-- 真人肖像：不上传到私域虚拟人像库；必须使用已经完成真人授权的 Asset ID。
-- 无法判断类型：停止人像资产步骤，请用户确认类型。
+- 默认路由：用户上传人物形象图后，直接记录为虚拟人像并计划创建新的私域 Asset，不增加人物类型、Asset 使用方式或素材权利的独立问答。该记录只形成本地计划，不触发上传或创建。
+- 默认虚拟人像：在第一次总确认中统一展示素材权利声明；用户确认后才能把该图用于第一阶段并在第二次确认后创建或复用私域虚拟人像 Asset。
+- 真人肖像：仅在用户主动说明时切换；不上传到私域虚拟人像库，必须使用已经完成真人授权的 Asset ID。
+- 已有 Asset：用户主动提供 Asset ID 时改为复用，不再创建新 Asset。
 - 产品图、白模和其他非人像素材不创建人像 Asset，继续使用普通参考 URL。
 
 ## 运行条件
 
 - 火山账号已开通私域素材库能力。
-- AK/SK 具备本流程所需的素材组和素材查询、创建权限；只使用已有 Asset ID 时至少能够调用 `GetAsset`。
-- Asset Group、Asset 与提交视频任务使用的 Ark API Key 属于同一 `ProjectName`。
-- 创建新 Asset 时还需可用的 TOS 上传配置；只查询已有 Asset 且没有其他上传素材时，仅需 AK/SK 与区域配置，不要求 Bucket 或 Endpoint。
+- Ark 配置中的 AK/SK 具备本流程所需的素材组和素材查询、创建权限；只使用已有 Asset ID 时至少能够调用 `GetAsset`。不得使用 TOS 配置中的 AK/SK 调用人物素材库。
+- Asset Group、Asset 与提交视频任务使用的 Ark API Key 都属于固定的 `ProjectName=default`。
+- 创建新 Asset 时还需独立的 TOS 上传配置；只查询已有 Asset 且没有其他上传素材时，仅需 Ark 配置中的 AK/SK，不要求 TOS 配置。
 
 素材库能力或 IAM 权限不足时保留原始 API 错误并停止，不把权限错误当作可重试的创建失败。
 
 ## API 契约
 
-素材 API 使用 AK/SK、`ark` 服务、`cn-beijing` 区域和 `2024-01-01` 版本：
+素材 API 只使用 Ark 配置中的 AK/SK、`ark` 服务、`cn-beijing` 区域和 `2024-01-01` 版本：
 
 1. `ListAssets`：使用人物图 SHA-256 派生的稳定名称查找 `Active` 或 `Processing` Asset。命中后先校验返回图片与本地人物图一致，复用 Asset ID，不上传图片、不创建素材组。
 2. `CreateAssetGroup`：没有可复用 Asset 时，创建 `GroupType=AIGC` 的素材组并记录 Group ID。
@@ -28,7 +29,7 @@
 4. `GetAsset`：轮询直到 `Status=Active`；`Processing` 继续查询，`Failed` 停止。单次查询网络失败可有限重试，创建接口仍不自动重发。
 5. 视频请求使用 `asset://<Asset ID>`，Prompt 仍按素材顺序写 `@图片N`，不写 Asset ID。
 
-`CreateAssetGroup`、`CreateAsset`、`GetAsset` 和视频生成使用相同 `ProjectName`。默认 `default`，非默认项目必须显式传入。创建接口结果未知时保存 `create_ambiguous`，不自动重复创建。
+`CreateAssetGroup`、`CreateAsset`、`GetAsset` 和视频生成统一使用固定的 `ProjectName=default`。创建接口结果未知时保存 `create_ambiguous`，不自动重复创建。
 
 ## 状态与恢复
 

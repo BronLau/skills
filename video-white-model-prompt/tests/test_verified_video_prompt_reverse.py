@@ -107,6 +107,40 @@ class VerifiedPromptTests(unittest.TestCase):
             max_inline_request_mb=9.5,
         )
 
+    def test_audio_rewrite_context_declares_complete_override_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self.make_args(Path(temporary))
+            args.allow_audio_rewrite = True
+            messages = MODULE.build_max_messages(
+                args,
+                "system",
+                "data:video/mp4;base64,AA==",
+                self.facts(),
+                10.0,
+                None,
+                [],
+            )
+            context_text = messages[1]["content"][-1]["text"]
+            context = json.loads(context_text.split("：\n", 1)[1])
+            permission = context["audio_permission"]
+            self.assertIn("segment_index", permission)
+            self.assertIn("shot_index", permission)
+            self.assertIn("audio", permission)
+            self.assertIn("JSON整数", permission)
+
+            overrides = MODULE.validate_audio_overrides(
+                [
+                    {
+                        "segment_index": 1,
+                        "shot_index": 1,
+                        "audio": "原创无歌词流行伴奏。",
+                    }
+                ],
+                self.facts(),
+                True,
+            )
+            self.assertEqual(overrides[(1, 1)], "原创无歌词流行伴奏。")
+
     def test_max_correction_must_match_every_fact_difference(self) -> None:
         omni = MODULE.validate_facts(self.facts(), 10, 15)
         verified = MODULE.validate_facts(

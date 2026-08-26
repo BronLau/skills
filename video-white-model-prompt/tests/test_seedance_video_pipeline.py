@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -619,26 +620,25 @@ class SeedancePipelineTests(unittest.TestCase):
                 }
             )
 
-    def test_asset_only_config_does_not_require_storage_fields(self) -> None:
+    def test_ark_config_carries_seedance_and_asset_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config_path = Path(temporary) / "asset.json"
+            config_path = Path(temporary) / "ark.json"
             config_path.write_text(
-                json.dumps(
-                    {
-                        "access_key": "ak",
-                        "secret_key": "sk",
-                        "region": "cn-beijing",
-                    }
-                ),
+                "ARK_API_KEY: ark-key-value-123456\n"
+                "accessKey: asset-ak\n"
+                "secretKey: asset-sk\n",
                 encoding="utf-8",
             )
 
-            config = MODULE.load_tos_config(
+            config = MODULE.load_ark_config(
                 config_path,
-                require_storage=False,
+                require_asset_credentials=True,
             )
 
-            self.assertEqual(config["access_key"], "ak")
+            self.assertEqual(config["api_key"], "ark-key-value-123456")
+            self.assertEqual(config["access_key"], "asset-ak")
+            self.assertEqual(config["secret_key"], "asset-sk")
+            self.assertEqual(config["region"], "cn-beijing")
             self.assertNotIn("bucket", config)
 
     def test_asset_library_builds_documented_openapi_requests(self) -> None:
@@ -810,12 +810,59 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertNotIn(str(source), json.dumps(request, ensure_ascii=False))
             self.assertNotIn("audio_url", json.dumps(request, ensure_ascii=False))
 
-    def test_markdown_config_supports_sts_role_and_authorized_prefix(self) -> None:
+    def test_prepare_and_request_include_authorized_voice_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config_path = root / "Volc engine_API_KEY.md"
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text("镜头1[00:00-00:10] 展示。\n", encoding="utf-8")
+            reference_audio = root / "voice.wav"
+            with wave.open(str(reference_audio), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(16000)
+                stream.writeframes(b"\x00\x00" * 16000 * 2)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.reference_audio = reference_audio
+            args.confirm_voice_rights = True
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            compiled = Path(body["segments"][0]["prompt"]["path"]).read_text(
+                encoding="utf-8"
+            )
+
+            request = MODULE.build_request(
+                body,
+                body["segments"][0],
+                [],
+                None,
+                "https://example.invalid/voice.wav",
+            )
+
+            self.assertEqual(body["schema_version"], 4)
+            self.assertTrue(body["audio_reference"]["rights_confirmed"])
+            self.assertIn("@音频1只作为全片人物口播的统一音色参考", compiled)
+            self.assertEqual(request["content"][-1]["type"], "audio_url")
+            self.assertEqual(request["content"][-1]["role"], "reference_audio")
+            self.assertEqual(request["omni_reference_task_type"], "reference")
+
+    def test_prepare_voice_reference_requires_rights_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            reference_audio = root / "voice.wav"
+            reference_audio.write_bytes(b"not-used-before-rights-check")
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.reference_audio = reference_audio
+            args.confirm_voice_rights = False
+
+            with self.assertRaisesRegex(MODULE.SeedanceError, "声音权利"):
+                MODULE.prepare(args)
+
+    def test_tos_markdown_supports_sts_role_and_authorized_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "TOS_Config.md"
             config_path.write_text(
-                "Volcengine_API_KEY: ark-key-value-123456\n\n"
                 "tos: endpoint: [tos-cn-beijing.volces.com]"
                 "(http://tos-cn-beijing.volces.com)  region: cn-beijing  "
                 "accessKey: AKLT-test  secretKey: secret-test  "
@@ -833,41 +880,44 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertEqual(
                 config["prefix"], "authorized/prod/video-white-model-prompt"
             )
-            self.assertEqual(
-                MODULE.load_key_file(config_path, "Key", "ARK_API_KEY"),
-                "ark-key-value-123456",
-            )
 
-    def test_split_directory_routes_credentials_by_service(self) -> None:
+    def test_ark_and_tos_files_keep_credentials_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "TOS_Config.md").write_text(
+            tos_path = root / "TOS_Config.md"
+            tos_path.write_text(
                 "endpoint: [tos-cn-beijing.volces.com]  region: cn-beijing  "
-                "accessKey: old-ak  secretKey: old-sk  bucket: test-bucket  "
+                "accessKey: tos-ak  secretKey: tos-sk  bucket: test-bucket  "
                 "roleTrn: trn:iam::1:role/tos-put  "
                 "publicDomain: https://tos.example.com/  "
                 "mainPath: authorized/prod\n",
                 encoding="utf-8",
             )
-            (root / "Volcengine_API_KEY.md").write_text(
-                "**accessKey**： new-ak\n**secretKey**： new-sk\n",
+            ark_path = root / "Volcengine_API_KEY.md"
+            ark_path.write_text(
+                "ARK_API_KEY: ark-key-value-123456\n"
+                "**accessKey**： asset-ak\n**secretKey**： asset-sk\n",
                 encoding="utf-8",
             )
 
-            config = MODULE.load_tos_config(root)
-
-            self.assertEqual(config["access_key"], "old-ak")
-            self.assertEqual(config["secret_key"], "old-sk")
-            self.assertEqual(config["asset_access_key"], "new-ak")
-            self.assertEqual(config["asset_secret_key"], "new-sk")
-            self.assertEqual(config["endpoint"], "tos-cn-beijing.volces.com")
-            self.assertEqual(config["bucket"], "test-bucket")
-            self.assertEqual(
-                config["prefix"], "authorized/prod/video-white-model-prompt"
+            tos_config = MODULE.load_tos_config(tos_path)
+            ark_config = MODULE.load_ark_config(
+                ark_path,
+                require_asset_credentials=True,
             )
-            asset_config = MODULE.ark_asset_config(config)
-            self.assertEqual(asset_config["access_key"], "new-ak")
-            self.assertEqual(asset_config["secret_key"], "new-sk")
+
+            self.assertEqual(tos_config["access_key"], "tos-ak")
+            self.assertEqual(tos_config["secret_key"], "tos-sk")
+            self.assertNotIn("asset_access_key", tos_config)
+            self.assertEqual(tos_config["endpoint"], "tos-cn-beijing.volces.com")
+            self.assertEqual(tos_config["bucket"], "test-bucket")
+            self.assertEqual(
+                tos_config["prefix"], "authorized/prod/video-white-model-prompt"
+            )
+            self.assertEqual(ark_config["api_key"], "ark-key-value-123456")
+            self.assertEqual(ark_config["access_key"], "asset-ak")
+            self.assertEqual(ark_config["secret_key"], "asset-sk")
+            self.assertEqual(ark_config["region"], "cn-beijing")
 
     def test_tos_publisher_assumes_role_and_returns_public_tos_url(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1248,6 +1298,7 @@ class SeedancePipelineTests(unittest.TestCase):
 
             tasks = FakeTasks()
             client = SimpleNamespace(content_generation=SimpleNamespace(tasks=tasks))
+            captured_configs: dict[str, dict[str, str]] = {}
             submit_args = SimpleNamespace(
                 plan=plan_path,
                 ark_api_key_file=None,
@@ -1278,7 +1329,14 @@ class SeedancePipelineTests(unittest.TestCase):
                 return destination
 
             with (
-                mock.patch.dict(os.environ, {"ARK_API_KEY": "ark-test-key-value"}),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ARK_API_KEY": "ark-test-key-value",
+                        "ARK_ACCESS_KEY": "asset-ak",
+                        "ARK_SECRET_KEY": "asset-sk",
+                    },
+                ),
                 mock.patch.object(
                     MODULE,
                     "load_tos_config",
@@ -1297,8 +1355,14 @@ class SeedancePipelineTests(unittest.TestCase):
                 MODULE.submit(
                     submit_args,
                     client_factory=lambda _: client,
-                    publisher_factory=lambda _config, _ttl: FakePublisher(),
-                    asset_library_factory=lambda _config, _project: FakeAssetLibrary(),
+                    publisher_factory=lambda config, _ttl: (
+                        captured_configs.setdefault("tos", dict(config))
+                        and FakePublisher()
+                    ),
+                    asset_library_factory=lambda config, _project: (
+                        captured_configs.setdefault("asset", dict(config))
+                        and FakeAssetLibrary()
+                    ),
                 )
 
             request = json.loads(
@@ -1312,6 +1376,10 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertEqual(
                 image_item["image_url"]["url"], "asset://asset-private"
             )
+            self.assertEqual(captured_configs["tos"]["access_key"], "ak")
+            self.assertEqual(captured_configs["tos"]["secret_key"], "sk")
+            self.assertEqual(captured_configs["asset"]["access_key"], "asset-ak")
+            self.assertEqual(captured_configs["asset"]["secret_key"], "asset-sk")
 
     def test_submit_creates_all_segments_before_parallel_polling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1543,6 +1611,62 @@ class SeedancePipelineTests(unittest.TestCase):
                 plan_path.with_name("tasks.json").read_text(encoding="utf-8")
             )
             self.assertEqual(state["segments"]["1"]["status"], "create_ambiguous")
+
+    def test_fact_lock_accepts_restricted_static_visual_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            overrides = root / "static_visual_overrides.json"
+            overrides.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "subject_definitions": {
+                            "<主要人物>": "将月白色太极服人物定义为<主要人物>。"
+                        },
+                        "shot_overrides": [
+                            {
+                                "segment_index": 1,
+                                "shot_index": 1,
+                                "scene_light": "清雅茶室，柔和窗侧自然光",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            lock = json.loads(args.fact_lock.read_text(encoding="utf-8"))
+            lock["assembly_mode"] = MODULE.STATIC_OVERRIDE_ASSEMBLY_MODE
+            lock["static_visual_overrides"] = MODULE.file_identity(overrides)
+            args.fact_lock.write_text(
+                json.dumps(lock, ensure_ascii=False), encoding="utf-8"
+            )
+
+            validated = MODULE.validate_fact_lock_file(
+                args.fact_lock, prompt, plan
+            )
+
+            self.assertEqual(
+                validated["assembly_mode"], MODULE.STATIC_OVERRIDE_ASSEMBLY_MODE
+            )
+
+    def test_static_visual_overrides_reject_action_fields(self) -> None:
+        with self.assertRaisesRegex(MODULE.SeedanceError, "镜头字段越权"):
+            MODULE.validate_static_visual_overrides(
+                {
+                    "schema_version": 1,
+                    "subject_definitions": {},
+                    "shot_overrides": [
+                        {
+                            "segment_index": 1,
+                            "shot_index": 1,
+                            "subject_action": "改成饮茶动作",
+                        }
+                    ],
+                }
+            )
 
 
 if __name__ == "__main__":

@@ -198,6 +198,7 @@ class PipelinePromptTests(unittest.TestCase):
                 "target_generator：Doubao Seedance 2.0",
                 fifteen_second_context,
             )
+            self.assertIn("image_reference_limit：9", fifteen_second_context)
 
             args.segment_max_seconds = 30
             thirty_second_context = MODULE.context_lines(args, "9:16", 10)
@@ -205,6 +206,30 @@ class PipelinePromptTests(unittest.TestCase):
                 "target_generator：Doubao Seedance 2.5",
                 thirty_second_context,
             )
+            self.assertIn("image_reference_limit：30", thirty_second_context)
+
+    def test_image_reference_limit_counts_character_and_product_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.character_image = root / "character.png"
+
+            args.product_image = [root / f"product-{index}.png" for index in range(8)]
+            MODULE.validate_args(args)
+
+            args.product_image.append(root / "product-9.png")
+            with self.assertRaisesRegex(MODULE.ScriptError, "Seedance 2.0.*9 张"):
+                MODULE.validate_args(args)
+
+            args.segment_max_seconds = 30
+            args.product_image = [
+                root / f"product-{index}.png" for index in range(29)
+            ]
+            MODULE.validate_args(args)
+
+            args.product_image.append(root / "product-30.png")
+            with self.assertRaisesRegex(MODULE.ScriptError, "Seedance 2.5.*30 张"):
+                MODULE.validate_args(args)
 
     def run_main(
         self,

@@ -31,6 +31,7 @@ from urllib.parse import urlparse
 from media_preflight import (
     MediaPreflightError,
     SEEDANCE_MAX_IMAGE_BYTES,
+    validate_seedance_image_count,
     validate_seedance_image_input as validate_seedance_image_input_shared,
 )
 from qwen_video_prompt_reverse import SEGMENT_HEADER_PATTERN
@@ -48,11 +49,15 @@ DEFAULT_RESOLUTION = "720p"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 ARK_OPENAPI_HOST = "open.volcengineapi.com"
 ARK_ASSET_API_VERSION = "2024-01-01"
+ARK_ASSET_REGION = "cn-beijing"
 MIN_GENERATION_SECONDS = 4
 MAX_GENERATION_SECONDS = 30
 MAX_SEED = 2**31 - 1
 MIN_REFERENCE_VIDEO_SECONDS = 2
 MAX_REFERENCE_VIDEO_SECONDS = 30
+MIN_REFERENCE_AUDIO_SECONDS = 2
+MAX_REFERENCE_AUDIO_SECONDS = 15
+MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 ASSET_QUERY_MAX_ATTEMPTS = 3
 ASSET_QUERY_RETRY_BASE_SECONDS = 1.0
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
@@ -69,6 +74,13 @@ TASK_INTENT_CONFLICTS = (
     re.compile(r"(?:向前|向后)延长"),
     re.compile(r"续写\s*@视频\d+"),
     re.compile(r"(?:删除|去掉|修改)\s*@视频\d+"),
+)
+BASE_FACT_ASSEMBLY_MODE = "deterministic_from_max_verified_facts"
+STATIC_OVERRIDE_ASSEMBLY_MODE = (
+    "deterministic_from_max_verified_facts_with_user_static_overrides"
+)
+AUDIO_OVERRIDE_ASSEMBLY_MODE = (
+    "deterministic_from_locked_visual_facts_with_verified_audio_overrides"
 )
 
 
@@ -120,6 +132,8 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--confirm-virtual-portrait-rights", action="store_true")
     prepare.add_argument("--product-image", type=Path, action="append", default=[])
     prepare.add_argument("--transcript-file", type=Path)
+    prepare.add_argument("--reference-audio", type=Path)
+    prepare.add_argument("--confirm-voice-rights", action="store_true")
     prepare.add_argument("--output-dir", type=Path, required=True)
     prepare.add_argument(
         "--resolution",
@@ -141,8 +155,16 @@ def parse_args() -> argparse.Namespace:
 
     submit = subparsers.add_parser("submit")
     submit.add_argument("--plan", type=Path, required=True)
-    submit.add_argument("--ark-api-key-file", type=Path)
-    submit.add_argument("--tos-config-file", type=Path)
+    submit.add_argument(
+        "--ark-api-key-file",
+        type=Path,
+        help="Ark 配置文件：Seedance API Key，以及人物素材库所需 AK/SK。",
+    )
+    submit.add_argument(
+        "--tos-config-file",
+        type=Path,
+        help="仅供 STS 与 TOS 上传使用的配置文件。",
+    )
     submit.add_argument("--poll-interval", type=float, default=30.0)
     submit.add_argument("--poll-timeout", type=float, default=7200.0)
     submit.add_argument("--signed-url-ttl", type=int, default=7 * 24 * 3600)
@@ -222,6 +244,8 @@ def plan_requires_storage(
     plan: dict[str, Any],
     character_reference: dict[str, Any] | None,
 ) -> bool:
+    if plan.get("audio_reference"):
+        return True
     if any(segment.get("depth_video") for segment in plan.get("segments") or []):
         return True
     for image in plan.get("images") or []:
@@ -234,6 +258,56 @@ def plan_requires_storage(
         ):
             return True
     return False
+
+
+def validate_reference_audio(path: Path) -> dict[str, Any]:
+    resolved = require_file(path, "音色参考音频")
+    if resolved.suffix.lower() not in {".mp3", ".wav"}:
+        raise SeedanceError("音色参考音频只支持 MP3 或 WAV。")
+    if resolved.stat().st_size >= MAX_REFERENCE_AUDIO_BYTES:
+        raise SeedanceError("音色参考音频必须小于 15 MB。")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise SeedanceError("未找到 ffprobe，无法校验音色参考音频。")
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=codec_type",
+                "-of",
+                "json",
+                str(resolved),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        metadata = json.loads(completed.stdout)
+        duration = float(metadata["format"]["duration"])
+        stream_types = [
+            str(stream.get("codec_type") or "")
+            for stream in metadata.get("streams") or []
+        ]
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise SeedanceError(f"ffprobe 无法读取音色参考音频：{resolved}") from exc
+    if "audio" not in stream_types or "video" in stream_types:
+        raise SeedanceError("音色参考必须是仅含音频流的 MP3 或 WAV。")
+    if not MIN_REFERENCE_AUDIO_SECONDS <= duration <= MAX_REFERENCE_AUDIO_SECONDS + 0.02:
+        raise SeedanceError(
+            "音色参考音频时长必须在 2 到 15 秒之间："
+            f"{duration:.3f} 秒"
+        )
+    return {"duration": duration, "format": resolved.suffix.lower().lstrip(".")}
 
 
 def character_image_asset(plan: dict[str, Any]) -> dict[str, Any]:
@@ -349,15 +423,88 @@ def prompt_text_sha256(path: Path) -> str:
     ).hexdigest()
 
 
+def validate_static_visual_overrides(body: dict[str, Any]) -> dict[str, Any]:
+    if set(body) != {"schema_version", "subject_definitions", "shot_overrides"}:
+        raise SeedanceError("静态视觉覆盖文件字段不完整或越权。")
+    if body.get("schema_version") != 1:
+        raise SeedanceError("静态视觉覆盖文件 schema_version 必须为 1。")
+    definitions = body.get("subject_definitions")
+    if not isinstance(definitions, dict):
+        raise SeedanceError("静态视觉覆盖 subject_definitions 必须是对象。")
+    normalized_definitions: dict[str, str] = {}
+    for label, value in definitions.items():
+        normalized_label = str(label).strip()
+        definition = str(value).strip()
+        if not re.fullmatch(r"<[^<>]+>", normalized_label):
+            raise SeedanceError(f"静态视觉覆盖主体标签无效：{normalized_label}")
+        if (
+            not definition
+            or "\n" in definition
+            or "{" in definition
+            or "}" in definition
+            or "镜头" in definition
+            or not definition.endswith(f"定义为{normalized_label}。")
+        ):
+            raise SeedanceError(f"静态视觉覆盖主体定义无效：{normalized_label}")
+        normalized_definitions[normalized_label] = definition
+
+    shot_overrides = body.get("shot_overrides")
+    if not isinstance(shot_overrides, list):
+        raise SeedanceError("静态视觉覆盖 shot_overrides 必须是数组。")
+    normalized_shots: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    allowed = {"segment_index", "shot_index", "composition", "scene_light"}
+    for item in shot_overrides:
+        if not isinstance(item, dict) or not set(item).issubset(allowed):
+            raise SeedanceError("静态视觉覆盖镜头字段越权。")
+        if not {"segment_index", "shot_index"}.issubset(item):
+            raise SeedanceError("静态视觉覆盖镜头缺少索引。")
+        key = (int(item["segment_index"]), int(item["shot_index"]))
+        if key[0] <= 0 or key[1] <= 0 or key in seen:
+            raise SeedanceError(f"静态视觉覆盖镜头索引无效或重复：{key}")
+        normalized: dict[str, Any] = {
+            "segment_index": key[0],
+            "shot_index": key[1],
+        }
+        for field in ("composition", "scene_light"):
+            if field not in item:
+                continue
+            value = str(item[field]).strip()
+            if (
+                not value
+                or "\n" in value
+                or "{" in value
+                or "}" in value
+                or "镜头" in value
+                or "@" in value
+            ):
+                raise SeedanceError(f"静态视觉覆盖 {field} 无效：{key}")
+            normalized[field] = value
+        if len(normalized) == 2:
+            raise SeedanceError(f"静态视觉覆盖镜头没有可修改字段：{key}")
+        seen.add(key)
+        normalized_shots.append(normalized)
+    if not normalized_definitions and not normalized_shots:
+        raise SeedanceError("静态视觉覆盖不能为空。")
+    return {
+        "schema_version": 1,
+        "subject_definitions": normalized_definitions,
+        "shot_overrides": normalized_shots,
+    }
+
+
 def validate_fact_lock_file(
     lock_path: Path,
     prompt_path: Path,
     segment_plan_path: Path,
 ) -> dict[str, Any]:
     body = load_json(lock_path, "Max 核验事实锁定记录")
-    if body.get("status") != "locked" or body.get("assembly_mode") != (
-        "deterministic_from_max_verified_facts"
-    ):
+    assembly_mode = body.get("assembly_mode")
+    if body.get("status") != "locked" or assembly_mode not in {
+        BASE_FACT_ASSEMBLY_MODE,
+        STATIC_OVERRIDE_ASSEMBLY_MODE,
+        AUDIO_OVERRIDE_ASSEMBLY_MODE,
+    }:
         raise SeedanceError("Max 核验事实尚未锁定，拒绝准备或提交 Seedance。")
     if body.get("prompt_sha256") != prompt_text_sha256(prompt_path):
         raise SeedanceError("正式提示词已变化，事实锁定记录失效。")
@@ -372,6 +519,24 @@ def validate_fact_lock_file(
         if not isinstance(identity, dict):
             raise SeedanceError(f"事实锁定记录缺少 {key}。")
         validate_identity(identity, label)
+    if assembly_mode == STATIC_OVERRIDE_ASSEMBLY_MODE:
+        identity = body.get("static_visual_overrides")
+        if not isinstance(identity, dict):
+            raise SeedanceError("静态视觉覆盖事实锁缺少覆盖文件。")
+        override_path = validate_identity(identity, "静态视觉覆盖文件")
+        validate_static_visual_overrides(
+            load_json(override_path, "静态视觉覆盖文件")
+        )
+    if assembly_mode == AUDIO_OVERRIDE_ASSEMBLY_MODE:
+        for key, label in (
+            ("base_fact_lock", "基础视觉事实锁"),
+            ("audio_fact_lock", "音频核验事实锁"),
+            ("audio_verification", "Max 音频核验结果"),
+        ):
+            identity = body.get(key)
+            if not isinstance(identity, dict):
+                raise SeedanceError(f"音频覆盖事实锁缺少 {key}。")
+            validate_identity(identity, label)
     return body
 
 
@@ -652,7 +817,12 @@ def split_prompt(prompt: str, segments: list[dict[str, Any]]) -> list[str]:
     return bodies
 
 
-def compile_prompt(body: str, image_count: int, with_depth: bool) -> str:
+def compile_prompt(
+    body: str,
+    image_count: int,
+    with_depth: bool,
+    with_reference_audio: bool = False,
+) -> str:
     if re.search(r"@(?:视频|音频)\d+", body):
         raise SeedanceError("Max 正式稿不得预先包含 @视频N 或 @音频N 引用。")
     compiled = re.sub(r"(?<!@)图片(?P<number>\d+)", r"@图片\g<number>", body)
@@ -667,6 +837,7 @@ def compile_prompt(body: str, image_count: int, with_depth: bool) -> str:
         raise SeedanceError(
             f"提示词引用了不存在的 @图片{max(indices)}，实际只有 {image_count} 张。"
         )
+    prefixes: list[str] = []
     if with_depth:
         appearance_source = (
             "人物、产品和场景外观以文字及@图片N为准。"
@@ -678,8 +849,14 @@ def compile_prompt(body: str, image_count: int, with_depth: bool) -> str:
             "空间布局、机位、运镜、切镜和时间节奏；不采用其中近白远黑的"
             f"深度可视化材质与灰阶颜色。{appearance_source}"
         )
-        return f"{prefix}\n{compiled.strip()}"
-    return compiled.strip()
+        prefixes.append(prefix)
+    if with_reference_audio:
+        prefixes.append(
+            "@音频1只作为全片人物口播的统一音色参考，仅参考人声音色、"
+            "发声质感、语速和韵律；不复用音频1中的原台词、背景音乐或环境声。"
+            "所有口播台词严格以各镜头大括号中的文字为准，并始终使用同一音色。"
+        )
+    return "\n".join([*prefixes, compiled.strip()])
 
 
 def prepare(args: argparse.Namespace) -> Path:
@@ -719,7 +896,29 @@ def prepare(args: argparse.Namespace) -> Path:
         if args.transcript_file
         else None
     )
+    reference_audio = (
+        require_file(getattr(args, "reference_audio"), "音色参考音频")
+        if getattr(args, "reference_audio", None)
+        else None
+    )
+    if reference_audio:
+        if not bool(getattr(args, "confirm_voice_rights", False)):
+            raise SeedanceError("使用音色参考前必须明确确认声音权利与授权。")
+        audio_metadata = validate_reference_audio(reference_audio)
+    else:
+        if bool(getattr(args, "confirm_voice_rights", False)):
+            raise SeedanceError("--confirm-voice-rights 必须与 --reference-audio 一起使用。")
+        audio_metadata = None
     images = ([character_image] if character_image else []) + product_images
+
+    segment_plan = load_json(plan_path, "分段计划")
+    segments = validate_segment_plan(segment_plan)
+    segment_max_seconds = int(segment_plan["segment_max_seconds"])
+    model_id = model_for_segment_max_seconds(segment_max_seconds)
+    try:
+        validate_seedance_image_count(segment_max_seconds, len(images))
+    except MediaPreflightError as exc:
+        raise SeedanceError(str(exc)) from exc
     for index, image in enumerate(images, start=1):
         validate_seedance_image(image, f"@图片{index}")
 
@@ -735,10 +934,6 @@ def prepare(args: argparse.Namespace) -> Path:
     for directory in (prompts_dir, assets_dir, generated_dir, responses_dir):
         directory.mkdir(exist_ok=True)
 
-    segment_plan = load_json(plan_path, "分段计划")
-    segments = validate_segment_plan(segment_plan)
-    segment_max_seconds = int(segment_plan["segment_max_seconds"])
-    model_id = model_for_segment_max_seconds(segment_max_seconds)
     prompt_bodies = split_prompt(prompt_path.read_text(encoding="utf-8"), segments)
     depth_files: list[Path] = []
     if args.depth_dir:
@@ -759,6 +954,8 @@ def prepare(args: argparse.Namespace) -> Path:
         generate_audio = bool(source_metadata["has_audio"] or transcript_file)
     else:
         generate_audio = args.generate_audio == "true"
+    if reference_audio and not generate_audio:
+        raise SeedanceError("使用音色参考时必须启用 generate_audio。")
     seed = args.seed if args.seed is not None else secrets.randbelow(MAX_SEED + 1)
     if not -1 <= seed <= MAX_SEED:
         raise SeedanceError(f"--seed 必须在 -1 到 {MAX_SEED} 之间。")
@@ -785,7 +982,12 @@ def prepare(args: argparse.Namespace) -> Path:
                 depth_files[index - 1], assets_dir / f"depth_part_{index:02d}.mp4"
             )
             depth_identity = file_identity(normalized)
-        compiled = compile_prompt(prompt_body, len(images), bool(depth_files))
+        compiled = compile_prompt(
+            prompt_body,
+            len(images),
+            bool(depth_files),
+            bool(reference_audio),
+        )
         prompt_file = prompts_dir / f"part_{index:02d}.txt"
         prompt_file.write_text(compiled.rstrip() + "\n", encoding="utf-8")
         prepared_segments.append(
@@ -801,7 +1003,7 @@ def prepare(args: argparse.Namespace) -> Path:
         )
 
     plan_body = {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "prepared",
         "run_id": uuid.uuid4().hex,
         "model": model_id,
@@ -812,6 +1014,21 @@ def prepare(args: argparse.Namespace) -> Path:
         "fact_lock": file_identity(lock_path),
         "segment_plan": file_identity(plan_path),
         "images": image_assets,
+        "audio_reference": (
+            {
+                "id": "audio-01",
+                "index": 1,
+                "kind": "audio",
+                "reference_role": "voice_timbre",
+                "identity": file_identity(reference_audio),
+                "duration_seconds": float(audio_metadata["duration"]),
+                "rights_confirmed": bool(
+                    getattr(args, "confirm_voice_rights", False)
+                ),
+            }
+            if reference_audio and audio_metadata
+            else None
+        ),
         "character_reference": (
             {
                 "image_id": "image-01",
@@ -869,6 +1086,39 @@ def resolve_ark_api_key(path: Path | None) -> str:
     if path is None:
         raise SeedanceError("未设置 ARK_API_KEY，也未提供 --ark-api-key-file。")
     return load_key_file(path, "Ark API Key 文件", "ARK_API_KEY")
+
+
+def load_ark_config(
+    path: Path | None,
+    require_asset_credentials: bool = False,
+) -> dict[str, str]:
+    config = {"api_key": resolve_ark_api_key(path)}
+    if path is not None:
+        resolved = path.expanduser().resolve()
+        file_config = read_tos_config_file(resolved, "Ark 配置文件")
+        for key in ("access_key", "secret_key", "security_token", "region"):
+            if file_config.get(key):
+                config[key] = file_config[key]
+    environment_mapping = {
+        "access_key": "ARK_ACCESS_KEY",
+        "secret_key": "ARK_SECRET_KEY",
+        "security_token": "ARK_SECURITY_TOKEN",
+        "region": "ARK_REGION",
+    }
+    for key, environment_name in environment_mapping.items():
+        value = os.environ.get(environment_name, "").strip()
+        if value:
+            config[key] = value
+    config.setdefault("region", ARK_ASSET_REGION)
+    if require_asset_credentials:
+        missing = [
+            key for key in ("access_key", "secret_key") if not config.get(key)
+        ]
+        if missing:
+            raise SeedanceError(
+                "Ark 配置缺少人物素材库凭证字段：" + ", ".join(missing)
+            )
+    return config
 
 
 def markdown_tos_value(content: str, name: str) -> str:
@@ -936,24 +1186,13 @@ def load_tos_config(
     config: dict[str, str] = {}
     if path:
         resolved = path.expanduser().resolve()
-        credentials_file: Path | None = None
         if resolved.is_dir():
             legacy_file = resolved / "Volc engine_API_KEY.md"
             if legacy_file.is_file():
                 resolved = legacy_file
             else:
-                credentials_file = resolved / "Volcengine_API_KEY.md"
                 resolved = resolved / "TOS_Config.md"
         config.update(read_tos_config_file(resolved, "火山 TOS 配置文件"))
-        if credentials_file and credentials_file.is_file():
-            credentials = read_tos_config_file(
-                credentials_file,
-                "Ark 人物 Asset AK/SK 配置文件",
-            )
-            if credentials.get("access_key"):
-                config["asset_access_key"] = credentials["access_key"]
-            if credentials.get("secret_key"):
-                config["asset_secret_key"] = credentials["secret_key"]
     environment_mapping = {
         "access_key": "TOS_ACCESS_KEY",
         "secret_key": "TOS_SECRET_KEY",
@@ -988,15 +1227,6 @@ def load_tos_config(
     if require_storage and config.get("public_domain"):
         config["public_domain"] = config["public_domain"].rstrip("/")
     return config
-
-
-def ark_asset_config(config: dict[str, str]) -> dict[str, str]:
-    asset_config = dict(config)
-    if config.get("asset_access_key"):
-        asset_config["access_key"] = config["asset_access_key"]
-    if config.get("asset_secret_key"):
-        asset_config["secret_key"] = config["asset_secret_key"]
-    return asset_config
 
 
 class TosPublisher:
@@ -1480,6 +1710,7 @@ def build_request(
     segment: dict[str, Any],
     image_urls: list[str],
     depth_url: str | None,
+    audio_url: str | None = None,
 ) -> dict[str, Any]:
     prompt = (
         validate_identity(segment["prompt"], "Seedance 分段提示词")
@@ -1503,6 +1734,14 @@ def build_request(
                 "role": "reference_video",
             }
         )
+    if audio_url:
+        content.append(
+            {
+                "type": "audio_url",
+                "audio_url": {"url": audio_url},
+                "role": "reference_audio",
+            }
+        )
     parameters = plan["parameters"]
     body = {
         "model": plan["model"],
@@ -1515,7 +1754,7 @@ def build_request(
         "seed": int(parameters["seed"]),
         "output_format": parameters["output_format"],
     }
-    if image_urls or depth_url:
+    if image_urls or depth_url or audio_url:
         body["omni_reference_task_type"] = "reference"
     return body
 
@@ -1817,18 +2056,38 @@ def submit(
         raise SeedanceError("Seedance 计划记录的最大分段时长与分段计划不一致。")
     for asset in plan.get("images") or []:
         validate_identity(asset["identity"], f"{asset['id']} 图片")
+    audio_reference = plan.get("audio_reference")
+    if audio_reference is not None:
+        if not isinstance(audio_reference, dict):
+            raise SeedanceError("Seedance 音色参考计划无效。")
+        if (
+            audio_reference.get("id") != "audio-01"
+            or audio_reference.get("reference_role") != "voice_timbre"
+            or not bool(audio_reference.get("rights_confirmed"))
+        ):
+            raise SeedanceError("Seedance 音色参考计划缺少权利确认或角色配置。")
+        audio_path = validate_identity(
+            audio_reference["identity"], "音色参考音频"
+        )
+        validate_reference_audio(audio_path)
     for segment in plan["segments"]:
         validate_identity(segment["prompt"], f"第 {segment['index']} 段提示词")
         if segment.get("depth_video"):
             validate_identity(segment["depth_video"], f"第 {segment['index']} 段白模")
 
-    api_key = resolve_ark_api_key(args.ark_api_key_file)
+    ark_config = load_ark_config(
+        args.ark_api_key_file,
+        require_asset_credentials=(
+            isinstance(character_reference, dict) and not legacy_query_only
+        ),
+    )
+    api_key = ark_config["api_key"]
     requires_storage = (
         False if legacy_query_only else plan_requires_storage(plan, character_reference)
     )
     tos_config = (
         load_tos_config(args.tos_config_file, require_storage=requires_storage)
-        if requires_storage or (character_reference is not None and not legacy_query_only)
+        if requires_storage
         else None
     )
     if client_factory is None:
@@ -1874,11 +2133,9 @@ def submit(
         or "default"
     )
     if isinstance(character_reference, dict) and not legacy_query_only:
-        if tos_config is None:
-            raise SeedanceError("人物 Asset 校验或创建缺少火山 AK/SK 配置。")
         asset_library_builder = asset_library_factory or ArkAssetLibrary
         asset_library = asset_library_builder(
-            ark_asset_config(tos_config),
+            ark_config,
             project_name,
         )
 
@@ -1938,6 +2195,9 @@ def submit(
             image_urls.append(character_asset_uri)
         else:
             image_urls.append(asset_url(str(asset["id"]), asset["identity"]))
+    audio_url = None
+    if not legacy_query_only and isinstance(audio_reference, dict):
+        audio_url = asset_url("audio-01", audio_reference["identity"])
     responses_dir = plan_path.parent / "responses"
     responses_dir.mkdir(exist_ok=True)
 
@@ -1989,7 +2249,9 @@ def submit(
         depth_url = None
         if segment.get("depth_video"):
             depth_url = asset_url(f"video-{index:02d}", segment["depth_video"])
-        request_body = build_request(plan, segment, image_urls, depth_url)
+        request_body = build_request(
+            plan, segment, image_urls, depth_url, audio_url
+        )
         atomic_write_json(
             responses_dir / f"request_part_{index:02d}.json", request_body
         )

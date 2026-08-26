@@ -1,8 +1,8 @@
 ---
 name: video-white-model-prompt
-description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；人物图参考支持私域虚拟人像 Asset 或已授权真人 Asset。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
+description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；支持人物图参考，以及经权利人授权的 2–15 秒人声音色参考。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
 metadata:
-  version: 1.12.1
+  version: 1.13.11
 ---
 
 # 视频白模、提示词反推与 Seedance 成片
@@ -17,15 +17,7 @@ metadata:
 
 采用渐进式向导收集信息。每轮消息只呈现当前步骤名称、一个问题、带编号的完整选项和回复示例，等待用户回答后再展示下一步。已经明确提供的信息自动填入并跳过对应步骤；后续步骤根据已选分支动态展开。
 
-### 步骤 1：确认唯一视频
-
-只把当前消息明确上传或提到的视频视为候选，不扫描其他目录猜测。原片始终只读。
-
-- 只有一个候选时展示文件名，并提供：`1. 使用这个视频`、`2. 更换视频`。
-- 没有候选时提供：`1. 上传视频`、`2. 提供本地文件路径`。
-- 有多个候选时逐项编号，并增加最后一项“重新上传或提供其他路径”。
-
-### 步骤 2：选择产出范围
+### 步骤 1：选择产出范围
 
 提供以下单选项：
 
@@ -34,66 +26,70 @@ metadata:
 3. `无白模+提示词+Seedance成片`：不生成白模，直接反推提示词并生成成片。
 4. `帮我推荐`：根据用户想要的最终结果推荐 1 至 3 中的一项，再让用户确认。
 
-### 步骤 3：选择最大分段时长
+### 步骤 2：选择最大分段时长
 
 提供以下单选项：
 
-1. `15s · Seedance 2.0`：单段范围 `[4,15]` 秒，调用 `doubao-seedance-2-0-260128`，通常会产生更多生成任务。
-2. `30s · Seedance 2.5`：单段范围 `[4,30]` 秒，调用 `doubao-seedance-2-5-260628`，通常任务数更少；默认优先推荐。
+1. `15s · Seedance 2.0`：单段范围 `[4,15]` 秒，调用 `doubao-seedance-2-0-260128`，图片类型素材合计最多 9 张，通常会产生更多生成任务。
+2. `30s · Seedance 2.5`：单段范围 `[4,30]` 秒，调用 `doubao-seedance-2-5-260628`，图片类型素材合计最多 30 张，通常任务数更少；默认优先推荐。
 
-### 步骤 4：按需收集成片补充信息
+### 步骤 3：按需收集成片补充信息
 
-仅步骤 2 选择两种 Seedance 成片模式时展示。先让用户多选准备提供的内容：
+仅步骤 1 选择两种 Seedance 成片模式时展示。先让用户多选准备提供的内容：
 
 1. `不提供补充信息`
 2. `产品名称`
-3. `产品图片`，最多 9 张
+3. `产品图片`，数量占用所选模型的图片类型素材总额度
 4. `人物形象图`
-5. `产品卖点`
-6. `创意要求`
+5. `口播音色参考`，使用 2 至 15 秒 MP3/WAV，或从唯一参考视频抽取连续口播
+6. `产品卖点`
+7. `创意要求`
 
-用户可回复一个或多个编号，例如 `2,3,5`；选项 1 与其他选项互斥。随后每轮只收集一个已选字段；每个字段都提供 `1. 现在提供`、`2. 跳过此项`。文件类字段在选择“现在提供”后，再提供 `1. 使用当前消息附件`、`2. 提供本地文件路径`。选择 `1. 不提供补充信息` 时直接进入下一步。
+用户可回复一个或多个编号，例如 `2,3,6`；选项 1 与其他选项互斥。随后每轮只收集一个已选字段；每个字段都提供 `1. 现在提供`、`2. 跳过此项`。文件类字段在选择“现在提供”后，再提供 `1. 使用当前消息附件`、`2. 提供本地文件路径`。选择 `1. 不提供补充信息` 时直接进入下一步。
 
 产品名称、卖点和创意默认不改变参考视频台词。只有用户主动提出口播修改时，才展示：`1. 保持原台词`、`2. 只替换指定旧词`、`3. 允许整段改写`。选择 2 后逐项收集 `旧词=新词`；选择 3 时记录明确授权。用户未提及口播修改时自动采用选项 1，不增加询问步骤。
 
-选择人物形象图时，读取 [私域人像资产链路](references/virtual_portrait_assets.md)，并继续单选：`1. 虚拟人像`、`2. 真人肖像`、`3. 无法确认类型`。选择 1 时再提供：`1. 创建新的私域 Asset`、`2. 使用已有 Asset ID`；创建前必须由用户明确确认素材为虚拟形象、合法拥有完整权利、不与自然人肖像雷同且不侵害第三方权益。选择 2 时必须提供已经完成真人授权的 Asset ID，不把真人肖像上传到私域虚拟人像库。选择 3 时停止人像资产步骤并说明两类资产边界。人物类型由用户声明，不通过自动人脸判断替代用户确认。
+选择口播音色参考时，必须由用户明确确认已获得声音权利人的授权，同意抽取、上传并用于音色参考。参考音频只约束全片人声的音色、发声质感、语速与韵律，台词仍以正式 Prompt 为准；不得把参考音频中的原台词、背景音乐或环境声当作成片内容。用户要求从参考视频抽取时，优先选择连续清晰口播并输出恰好 15 秒的单声道 WAV；原视频保持只读。声音授权不继承人物图片的虚拟人像权利确认，两者分别记录。
 
-### 步骤 5：选择 Qwen Key 来源
+选择人物形象图时，读取 [私域人像资产链路](references/virtual_portrait_assets.md)。人物图上传后默认记录为 `character_image_type=virtual` 并创建新的私域 Asset，不再单独询问人物类型、Asset 创建或复用方式、素材权利；记录默认值后直接继续收集其他信息。该默认值是工作流路由，不是自动人脸判断。用户主动说明是真人肖像时切换为 `real`，必须提供已经完成真人授权的 Asset ID，不把真人肖像上传到私域虚拟人像库；用户主动提供已有 Asset ID 时改为复用。默认虚拟人像的素材权利声明合并到步骤 6 的第一次总确认中。
+
+### 步骤 4：选择 Qwen Key 来源
 
 仅两种 Seedance 成片模式需要。不要要求用户在聊天中粘贴 Key，提供：
 
 1. `使用 DASHSCOPE_API_KEY 环境变量`
 2. `提供 Key 文件路径`
-3. `提供 Key 目录路径`，目录默认读取 `DASHSCOPE_API_KEY.md`
-4. `暂未配置`，说明完成配置后可从本步骤继续
+3. `暂未配置`，说明完成配置后可从本步骤继续
 
 Ark Key 和火山 TOS 在第一阶段不使用，延后到 Seedance 提交前收集。无白模且无图片时不需要 TOS。所有生成视频在用户未明确指定分辨率时统一使用 `720p`；只有用户明确要求时才传 `480p` 或 `1080p`。其余默认值为跟随原片画幅、`mp4`、无水印，并根据原片是否有音轨自动决定 `generate_audio`。
 
-### 步骤 6：只读预检
+### 步骤 5：预检与分析媒体准备
 
-确认前检查视频、图片、转写、Key 来源、`ffmpeg`/`ffprobe`、Python 依赖、磁盘和按范围所需的深度模型。
+确认前以只读方式检查视频、图片、转写、Key 来源、`ffmpeg`/`ffprobe`、Python 依赖、磁盘和按范围所需的深度模型。
 
-Qwen 分析媒体继续使用 Base64 Data URL，逐文件上限为 9.5 MiB；超限不上传 TOS，也不擅自压缩。提示用户按动态 FFmpeg 命令生成压缩分析版，保持 `--video` 指向原片、`--analysis-video` 指向压缩版。共享 `scripts/media_preflight.py` 负责两者的音轨、画幅、时长、时间轴和五点画面相似度校验。
+Qwen 分析媒体继续使用 Base64 Data URL，逐文件上限为 9.5 MiB；视频超限时不上传 TOS，也不增加用户确认步骤，直接按动态 FFmpeg 参数生成压缩分析副本。原片始终只读；压缩副本写入本次运行的独立暂存目录，保持 `--video` 指向原片、`--analysis-video` 指向压缩版。共享 `scripts/media_preflight.py` 负责两者的音轨、画幅、时长、时间轴和五点画面相似度校验；压缩或一致性校验失败时停止，不回退为上传超限原片。图片超限时不得擅自改变用户提供的外观素材，仍应提示用户提供合规图片。
 
 Seedance 成片模式要求参考视频至少 4 秒。每段必须是 4 到用户上限之间的整数秒，分段数量固定为 `ceil(总时长 / 用户上限)`：优先使用最少任务数并让各段尽量接近最大时长；尾段不足 4 秒时前移上一切点重新分配，不产生短尾段。
 
 带白模成片时，正式白模仍保持原画幅、CFR、H.264、720p、无音频。若其 FPS、编码、尺寸或宽高比不符合 Seedance 参考视频要求，只在 `seedance/assets/` 生成兼容副本，不修改正式白模。
 
-Seedance 图片在提交前检查大小、像素和宽高比。人物形象图还必须具有明确的人像类型和 Asset 路由；产品图不进入人像素材库。使用人物 Asset 前确认账号已开通私域素材库能力，AK/SK 具备所需 IAM 权限，且 Asset、Asset Group 与 Ark API Key 属于同一 `ProjectName`。创建新虚拟 Asset 时，先按人物图 SHA-256 稳定名称调用 `ListAssets` 查找可复用素材；该查询也作为上传前的访问预检。Ark API 拒绝时原样保留错误并停止。
+Seedance 图片在提交前检查总数、大小、像素和宽高比。图片类型素材总数包含人物图和产品图：15 秒分段对应 Seedance 2.0，合计不得超过 9 张；30 秒分段对应 Seedance 2.5，合计不得超过 30 张。人物形象图还必须具有明确的人像类型和 Asset 路由；产品图不进入人像素材库。使用人物 Asset 前确认账号已开通私域素材库能力，Ark 配置中的 AK/SK 具备所需 IAM 权限，且 Asset、Asset Group 与 Ark API Key 都属于固定的 `ProjectName=default`。创建新虚拟 Asset 时，先按人物图 SHA-256 稳定名称调用 `ListAssets` 查找可复用素材；该查询也作为上传前的访问预检。Ark API 拒绝时原样保留错误并停止。
+
+音色参考在提交前检查格式、大小、时长和纯音频流：仅 MP3/WAV、小于 15 MB、时长 `[2,15]` 秒。正式分段 Prompt 使用 `@音频1`，明确只参考统一人声音色，不复用参考音频中的台词或背景声。音色参考作为 `audio_url`、`role=reference_audio` 提交；它不是人物图片 Asset，也不混入虚拟人像素材组。
 
 深度模型只在 `仅白模` 和 `白模+提示词+Seedance成片` 中解析，顺序为命令参数、`DEPTH_ANYTHING_MODEL`、Skill 本地模型、机器已知模型路径。无白模模式不得要求深度模型。
 
-### 步骤 7：第一次确认
+### 步骤 6：第一次确认
 
-启动 Qwen 或本地深度任务前，汇总输入、范围、分段上限、由分段上限确定的 Seedance 模型、图片、口播权限、Qwen Key 来源和默认 Seedance 参数。明确说明：
+启动 Qwen 或本地深度任务前，汇总输入、范围、分段上限、由分段上限确定的 Seedance 模型、图片、口播权限、Qwen Key 来源和默认 Seedance 参数。存在人物图时还要明确展示人物类型与 Asset 创建或复用方式。人物图按默认虚拟人像创建新 Asset 时，在本次总确认中声明：用户确认该图片为虚拟形象、合法拥有完整权利、不与自然人肖像雷同且不侵害第三方权益。明确说明：
 
 - 分析视频及其中的音轨会发送至 Omni，用于提取结构化原片事实；分析视频、Omni 事实和用户提供的图片会发送至 Max，用于对照原片纠正事实并绑定静态外观。正常流程调用 Omni 与 Max 各一次；任一阶段 JSON 或事实契约未通过时，该阶段最多定向修复一次。
-- 原始参考视频和原始音轨不会发送至 Seedance。
+- 原始参考视频和完整原始音轨不会发送至 Seedance；选择音色参考时，仅把用户确认的 2 至 15 秒音频片段发送至 Seedance。
 - Seedance 每个最终分段对应一个独立生成任务；素材只在第二次确认后上传火山 TOS 和提交 Ark。
 - 虚拟人物图只在第二次确认后上传 TOS、创建或查询私域 Asset，并在状态为 `Active` 后用于 Seedance；真人肖像只查询用户提供的已授权 Asset ID。
 - 当前 TOS 配置通过 `publicDomain` 暴露生成素材 URL，写入角色不能主动删除对象；提交前必须说明公开可读范围和 Bucket 生命周期依赖。
 
-最后提供：`1. 确认并开始第一阶段`、`2. 修改以上信息`、`3. 取消`。用户选择 1 后冻结本次输入。
+最后提供：`1. 确认并开始第一阶段`、`2. 修改以上信息`、`3. 取消`。存在默认虚拟人像时，选项 1 改为 `确认以上信息与人物素材权利声明，并开始第一阶段`；用户选择 1 后才记录权利确认、追加 `--confirm-virtual-portrait-rights` 并冻结本次输入。
 
 ## 第一阶段：准备正式产物
 
@@ -114,7 +110,7 @@ python3 <skill-root>/scripts/run_pipeline.py \
 ```bash
   --analysis-video <可选压缩分析视频> \
   --product-name <可选> \
-  --product-image <可重复最多9次> \
+  --product-image <可重复；与人物图合计最多9或30张> \
   --character-image <可选> \
   --character-image-type <virtual|real> \
   --character-asset-id <已有Asset时传入> \
@@ -124,7 +120,9 @@ python3 <skill-root>/scripts/run_pipeline.py \
   --spoken-replacement <用户明确指定的旧词=新词，可重复> \
   --allow-audio-rewrite \
   --transcript-file <可选> \
-  --api-key-file <可选Qwen Key文件或目录> \
+  --reference-audio <可选2至15秒MP3或WAV> \
+  --confirm-voice-rights \
+  --api-key-file <可选Qwen Key文件> \
   --seedance-resolution <480p|720p|1080p> \
   --seedance-ratio <source|adaptive|固定画幅> \
   --seedance-output-format <mp4|mov> \
@@ -140,7 +138,9 @@ Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序
 
 人物图和产品图只进入结构化 `appearance_bindings`，每项只能包含主体标签和图片编号数组，不允许 Max 输出自由文本主体定义。人物图只能绑定 `kind=character`，产品图只能绑定 `kind=product`，每张图片只能绑定一个主体；最终主体定义由程序生成，因此替换素材不能通过定义文本夹带动作、姿态变化、景别、运镜、身体可见范围或进出场。
 
-默认音频直接采用 Omni 事实；指定词替换由程序确定性执行；只有用户明确允许整段改写时，Max 才能通过 `audio_overrides` 修改对应镜头音频。最终 Prompt 由程序使用 Max 核验事实、静态外观绑定和授权音频覆盖确定性组装，Max 无法在组装阶段新增镜头动作。
+默认音频直接采用 Omni 事实；指定词替换由程序确定性执行；只有用户明确允许整段改写时，Max 才能通过 `audio_overrides` 修改对应镜头音频。每个音频覆盖项必须且只能包含整数 `segment_index`、整数 `shot_index` 和完整字符串 `audio`，并指向已存在的镜头。最终 Prompt 由程序使用 Max 核验事实、静态外观绑定和授权音频覆盖确定性组装，Max 无法在组装阶段新增镜头动作。
+
+已锁定计划因音频策略失败，而用户只授权修改音频时，保留原失败计划和任务状态；Max 新结果只提供通过契约校验的 `audio_overrides`。使用 `scripts/merge_verified_audio_override.py` 把这些音频覆盖确定性合并到上一版已锁定的视觉事实与外观绑定中，拒绝新 Max 结果带来的任何视觉字段、主体、分段或时间轴漂移，并为新计划生成独立事实锁。
 
 程序确定性组装的正式 Prompt 必须使用 `@图片N`，不输出 4K、画幅、分辨率等 API 参数，也不写视频编辑或延长意图。每段完成程序生成的主体定义后直接进入 `镜头1[...]`；场景、光线、主体状态和声音信息来自 Max 核验事实，不输出段级整体概述。每段镜头1对应原片分段起点，段内镜头沿用 Max 根据原片核验后的顺序。`seedance_video_pipeline.py prepare` 会拆出每段独立 Prompt；带白模模式直接以 `@视频1` 深度白模职责开头，无白模模式不增加任何视频引用。
 
@@ -150,17 +150,19 @@ Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序
 
 第一阶段成功后，再分步收集提交配置，每轮只问一项：
 
-- Ark Key 来源：`1. 使用 ARK_API_KEY 环境变量`、`2. 提供 Key 文件路径`、`3. 暂不提交并保留第一阶段产物`。不要要求用户在聊天中粘贴 Key。
-- 带白模、产品图或需要创建新虚拟 Asset 时，火山 TOS 来源：`1. 使用已配置的 TOS 环境变量`、`2. 使用当前机器默认目录 /Users/bron/Documents/CodeX/API/火山`、`3. 提供配置文件或目录路径`、`4. 暂不提交并保留第一阶段产物`。只使用火山 TOS，不接入其他 OSS。仅查询已有人物 Asset 且没有其他上传素材时，仍从该配置读取 AK/SK 和区域，但不要求 Bucket 或 Endpoint。
-- 使用人物 Asset 时收集 `ProjectName`：`1. default`、`2. 指定其他项目名称`。Asset Group、Asset 和 Ark API Key 必须属于同一项目。
+- Ark 配置来源：`1. 使用 ARK_API_KEY 环境变量`、`2. 提供 Key 文件路径`、`3. 暂不提交并保留第一阶段产物`。不要要求用户在聊天中粘贴 Key。人物 Asset 流程还要求同一 Ark 配置来源提供素材库 AK/SK；文件模式从同一文件读取 `accessKey`、`secretKey`，环境变量模式读取 `ARK_ACCESS_KEY`、`ARK_SECRET_KEY`。Ark API Key 只用于 Seedance，Ark AK/SK 只用于人物素材库。
+- 带白模、产品图、音色参考或需要创建新虚拟 Asset 时，火山 TOS 来源：`1. 使用已配置的 TOS 环境变量`、`2. 提供配置文件路径`、`3. 暂不提交并保留第一阶段产物`。只使用火山 TOS，不接入其他 OSS。TOS 配置仅用于 STS 与 TOS 上传，不得为人物素材库提供或回退 AK/SK；仅查询已有人物 Asset 且没有其他待上传素材时不要求 TOS 配置。
+- 使用人物 Asset 时不再询问 `ProjectName`，固定使用 `default`。Asset Group、Asset 和 Ark API Key 必须都属于 `default` 项目。
 
-完整展示正式提示词、Max 事实修正摘要、Seedance 模型、任务数、每段时长、是否带白模、图片数量、人物类型、人物 Asset 创建或复用方式、`ProjectName`、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
+完整展示正式提示词、Max 事实修正摘要、Seedance 模型、任务数、每段时长、是否带白模、图片数量、音色参考及授权状态、人物类型、人物 Asset 创建或复用方式、固定的 `ProjectName=default`、`generate_audio`、分辨率、画幅、格式和水印。用户明确确认提交范围后才运行：
 
 1. `确认并提交全部分段`
 2. `修改生成参数`
 3. `暂不提交并保留第一阶段产物`
 
 选择 2 时，先确认 `seedance/tasks.json` 不存在，或其中 `uploads`、`segments` 均为空；已有上传记录或任务 ID 时不覆盖原计划。确认尚未提交后，复用原 `prompt.txt`、`segment_plan.json`、原片、图片和白模目录，重新运行 `seedance_video_pipeline.py prepare --overwrite`，只替换用户修改的参数；未明确修改的参数和原 Seed 保持不变。重建并校验 `seedance_plan.json` 后，重新展示第二次确认。
+
+用户在尚未上传或创建任务时明确要求修改人物静态服饰、场景或构图的，不能直接手改已锁定 Prompt。把用户确认后的覆盖项写入独立 JSON，并使用 `scripts/apply_static_visual_overrides.py` 重建 Prompt 和事实锁；覆盖范围只允许主体静态定义以及逐镜头 `composition`、`scene_light`，不得改变动作、景别、机位、运镜、进出场、时间轴或音频。随后按原参数重新运行 `seedance_video_pipeline.py prepare --overwrite`，校验新计划并再次展示第二次确认。
 
 ```bash
 python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
@@ -174,6 +176,8 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --character-asset-id <按原计划可选> \
   --confirm-virtual-portrait-rights \
   --product-image <按原计划可重复> \
+  --reference-audio <按原计划可选> \
+  --confirm-voice-rights \
   --output-dir <输出目录>/seedance \
   --resolution <修改后值> \
   --ratio <修改后值> \
@@ -187,15 +191,15 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
 python3 <skill-root>/scripts/seedance_video_pipeline.py submit \
   --plan <输出目录>/seedance/seedance_plan.json \
   --ark-api-key-file <可选Ark Key文件> \
-  --tos-config-file <有素材时的火山TOS配置文件或目录> \
-  --asset-project-name <人物Asset所在项目，默认default>
+  --tos-config-file <有素材时的火山TOS配置文件> \
+  --asset-project-name default
 ```
 
 只有用户针对人物 Asset 再次明确确认后，才追加 `--retry-failed-character-asset` 或 `--allow-recreate-ambiguous-character-asset`。这两个参数不由视频任务的 `--retry-failed` 或 `--allow-recreate-ambiguous` 代替。
 
-火山配置支持两种格式：JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段；或本机 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`，字段可使用普通 Markdown、加粗标签、ASCII 冒号或全角冒号。传目录时优先兼容旧版单文件 `Volc engine_API_KEY.md`；旧文件不存在时，`TOS_Config.md` 中的 `accessKey`、`secretKey` 专用于 STS AssumeRole 与 TOS 上传，`Volcengine_API_KEY.md` 中的 `accessKey`、`secretKey` 专用于 Ark 人物 Asset API。创建或上传素材需要完整 TOS 字段；只查询已有人物 Asset 时只要求对应 Ark Asset AK/SK 和区域。配置文件包含密钥，不作为交付物展示。
+Ark 配置文件同时承载 Seedance 的 `ARK_API_KEY`（兼容 `Volcengine_API_KEY` 标签）以及人物素材库的 `accessKey`、`secretKey`；素材库区域固定为 `cn-beijing`。TOS 配置支持 JSON 的 `access_key`、`secret_key`、`endpoint`、`region`、`bucket` 等字段，或 Markdown 中的 `accessKey`、`secretKey`、`endpoint`、`region`、`bucket`、`roleTrn`、`mainPath`、`publicDomain`。字段可使用普通 Markdown、加粗标签、ASCII 冒号或全角冒号。TOS 的 `accessKey`、`secretKey` 专用于 STS AssumeRole 与 TOS 上传，不得传给 Ark 人物素材 API；Ark 与 TOS 凭证之间不得互相回退。配置文件包含密钥，不作为交付物展示。
 
-配置存在 `roleTrn` 时先通过 STS AssumeRole 获取临时写入凭证，所有对象必须写入 `mainPath/video-white-model-prompt/` 授权前缀；存在 `publicDomain` 时优先使用经过 URL 编码的公开 TOS 链接提交 Seedance，否则使用签名 URL。无白模且无图片时直接文生视频，不要求 TOS。原片和原始音轨在任何模式下都不上传 Seedance；声音仅由正式提示词和 `generate_audio` 控制。
+配置存在 `roleTrn` 时先通过 STS AssumeRole 获取临时写入凭证，所有对象必须写入 `mainPath/video-white-model-prompt/` 授权前缀；存在 `publicDomain` 时优先使用经过 URL 编码的公开 TOS 链接提交 Seedance，否则使用签名 URL。无白模、无图片且无音色参考时直接文生视频，不要求 TOS。原片和完整原始音轨不上传 Seedance；选择音色参考时仅上传用户已授权的音频片段，声音由正式提示词、`@音频1` 和 `generate_audio` 共同控制。
 
 虚拟人物图没有已有 Asset ID 时，提交阶段先用图片 SHA-256 派生的稳定名称调用 `ListAssets`。命中 `Active` 或 `Processing` 素材时校验远端图片与本地人物图一致并复用，不上传原图；没有命中时才上传该图获取可访问 URL，再依次调用 `CreateAssetGroup`、`CreateAsset` 和 `GetAsset`。只有 `Status=Active` 才把 `asset://<Asset ID>` 作为人物图片 URL 写入 Seedance 请求。`GetAsset` 的临时查询错误有限重试；`Processing` 持续查询，`Failed` 或超时停止并保留状态。提示词仍使用 `@图片N`，不写 Asset ID。产品图继续使用普通 TOS URL。
 

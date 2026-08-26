@@ -19,6 +19,7 @@ from media_preflight import (
     build_compression_command,
     estimated_data_url_size,
     probe_video_signature,
+    validate_seedance_image_count,
     validate_analysis_video as validate_analysis_video_shared,
     validate_image_input as validate_image_input_shared,
     validate_seedance_image_input as validate_seedance_image_input_shared,
@@ -80,6 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-audio-rewrite", action="store_true")
     parser.add_argument("--spoken-replacement", action="append", default=[])
     parser.add_argument("--transcript-file", type=Path)
+    parser.add_argument("--reference-audio", type=Path)
+    parser.add_argument("--confirm-voice-rights", action="store_true")
     parser.add_argument("--api-key-file", type=Path)
     parser.add_argument("--depth-model", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -228,6 +231,7 @@ def run_manifest(
     character_image: Path | None,
     product_images: list[Path],
     transcript_file: Path | None,
+    reference_audio: Path | None,
 ) -> dict[str, object]:
     body: dict[str, object] = {
         "schema_version": 2,
@@ -241,6 +245,10 @@ def run_manifest(
         "selling_points": args.selling_points.strip(),
         "user_idea": args.user_idea.strip(),
         "transcript_file": file_identity(transcript_file),
+        "reference_audio": file_identity(reference_audio),
+        "voice_rights_confirmed": bool(
+            getattr(args, "confirm_voice_rights", False)
+        ),
         "depth_model": file_identity(model),
         "seedance": {
             "resolution": args.seedance_resolution,
@@ -442,6 +450,7 @@ def build_seedance_prepare_command(
     product_images: list[Path],
     transcript_file: Path | None,
     with_depth: bool,
+    reference_audio: Path | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -481,6 +490,10 @@ def build_seedance_prepare_command(
         command.extend(["--product-image", str(image)])
     if transcript_file:
         command.extend(["--transcript-file", str(transcript_file)])
+    if reference_audio:
+        command.extend(["--reference-audio", str(reference_audio)])
+        if bool(getattr(args, "confirm_voice_rights", False)):
+            command.append("--confirm-voice-rights")
     if args.seedance_watermark:
         command.append("--watermark")
     if args.seedance_seed is not None:
@@ -508,8 +521,13 @@ def main() -> int:
             if args.analysis_video
             else video
         )
-        if len(args.product_image) > 9:
-            raise PipelineError("产品图片最多 9 张")
+        try:
+            validate_seedance_image_count(
+                args.segment_max_seconds,
+                int(args.character_image is not None) + len(args.product_image),
+            )
+        except MediaPreflightError as exc:
+            raise PipelineError(str(exc)) from exc
         product_images = [
             require_file(path, f"第{index}张产品图")
             for index, path in enumerate(args.product_image, start=1)
@@ -544,6 +562,19 @@ def main() -> int:
             if args.transcript_file
             else None
         )
+        reference_audio = (
+            require_file(getattr(args, "reference_audio"), "音色参考音频")
+            if getattr(args, "reference_audio", None)
+            else None
+        )
+        if reference_audio and not bool(
+            getattr(args, "confirm_voice_rights", False)
+        ):
+            raise PipelineError("使用音色参考前必须明确确认声音权利与授权。")
+        if bool(getattr(args, "confirm_voice_rights", False)) and not reference_audio:
+            raise PipelineError(
+                "--confirm-voice-rights 必须与 --reference-audio 一起使用。"
+            )
         if args.scope == "depth-only" and (
             args.product_name.strip()
             or product_images
@@ -556,6 +587,8 @@ def main() -> int:
             or args.allow_audio_rewrite
             or args.spoken_replacement
             or transcript_file
+            or reference_audio
+            or args.confirm_voice_rights
             or args.analysis_video
             or args.api_key_file
         ):
@@ -598,6 +631,7 @@ def main() -> int:
             character_image,
             product_images,
             transcript_file,
+            reference_audio,
         )
         if args.resume:
             validate_manifest(manifest_path, expected_manifest)
@@ -849,6 +883,7 @@ def main() -> int:
                 product_images,
                 transcript_file,
                 with_depth,
+                reference_audio,
             )
             prepare_code = run_process(seedance_prepare)
             if prepare_code != 0:
