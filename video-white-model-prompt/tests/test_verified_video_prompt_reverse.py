@@ -154,6 +154,50 @@ class VerifiedPromptTests(unittest.TestCase):
                     True,
                 )
 
+    def test_max_context_declares_aggregate_correction_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self.make_args(Path(temporary))
+            messages = MODULE.build_max_messages(
+                args,
+                "system",
+                "data:video/mp4;base64,AA==",
+                self.facts(),
+                10.0,
+                None,
+                [],
+            )
+            context_text = messages[1]["content"][-1]["text"]
+            context = json.loads(context_text.split("：\n", 1)[1])
+            contract = context["correction_path_contract"]
+
+            self.assertEqual(
+                contract["shot_plan"]["path"],
+                "segments[i].shot_plan",
+            )
+            self.assertEqual(
+                contract["shot_visuals"]["path"],
+                "segments[i].shot_visuals",
+            )
+            self.assertIn(
+                "segments[i].shots[j].end_seconds",
+                contract["shot_plan"]["forbidden_paths"],
+            )
+            self.assertEqual(
+                contract["shot_visuals"]["value_fields"],
+                [*MODULE.VISUAL_FIELDS, "beats"],
+            )
+            self.assertNotIn(
+                "audio",
+                contract["shot_visuals"]["value_fields"],
+            )
+            timeline = context["timeline_contract"]
+            self.assertEqual(timeline["time_type"], "JSON整数")
+            self.assertFalse(timeline["fractional_seconds_allowed"])
+            self.assertIn(
+                "segments[i].shots[j].beats[k].end_seconds",
+                timeline["applies_to"],
+            )
+
     def test_beats_are_continuous_and_rendered_inside_one_shot(self) -> None:
         body = self.facts(camera="固定机位", action="人物表情逐渐变化")
         body["segments"][0]["shots"][0]["beats"] = [
@@ -324,6 +368,59 @@ class VerifiedPromptTests(unittest.TestCase):
         differences = MODULE.visual_differences(omni, verified, 10.0)
         self.assertIn("segments[0].shot_plan", differences)
         self.assertIn("segments[0].shot_visuals", differences)
+        self.assertEqual(
+            differences["segments[0].shot_plan"][2],
+            (0.0, 5.0, 10.0),
+        )
+
+    def test_shot_plan_evidence_includes_shot_and_beat_sample_points(self) -> None:
+        body = self.facts(camera="固定机位")
+        original = body["segments"][0]["shots"][0]
+        first = {
+            **original,
+            "index": 1,
+            "start_seconds": 0,
+            "end_seconds": 4,
+            "beats": [
+                {
+                    "index": 1,
+                    "start_seconds": 0,
+                    "end_seconds": 4,
+                    "action": "人物保持正面姿态",
+                }
+            ],
+        }
+        second = {
+            **original,
+            "index": 2,
+            "start_seconds": 4,
+            "end_seconds": 10,
+            "beats": [
+                {
+                    "index": 1,
+                    "start_seconds": 4,
+                    "end_seconds": 7,
+                    "action": "人物抬手",
+                },
+                {
+                    "index": 2,
+                    "start_seconds": 7,
+                    "end_seconds": 10,
+                    "action": "人物放下手",
+                },
+            ],
+        }
+        body["segments"][0]["shots"] = [first, second]
+        facts = MODULE.validate_facts(body, 10, 15)
+        allowed = MODULE.evidence_time_index(facts, 10.0)[
+            "segments[0].shot_plan"
+        ]
+
+        self.assertIn(2.0, allowed)
+        self.assertIn(4.0, allowed)
+        self.assertIn(5.5, allowed)
+        self.assertIn(7.0, allowed)
+        self.assertIn(8.5, allowed)
 
     def test_main_uses_two_calls_and_renders_max_verified_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

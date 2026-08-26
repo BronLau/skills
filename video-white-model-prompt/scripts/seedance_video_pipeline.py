@@ -427,10 +427,14 @@ def prompt_text_sha256(path: Path) -> str:
 
 
 def validate_static_visual_overrides(body: dict[str, Any]) -> dict[str, Any]:
-    if set(body) != {"schema_version", "subject_definitions", "shot_overrides"}:
+    schema_version = body.get("schema_version")
+    expected = {"schema_version", "subject_definitions", "shot_overrides"}
+    if schema_version == 2:
+        expected.add("subject_aliases")
+    elif schema_version != 1:
+        raise SeedanceError("静态视觉覆盖文件 schema_version 必须为 1 或 2。")
+    if set(body) != expected:
         raise SeedanceError("静态视觉覆盖文件字段不完整或越权。")
-    if body.get("schema_version") != 1:
-        raise SeedanceError("静态视觉覆盖文件 schema_version 必须为 1。")
     definitions = body.get("subject_definitions")
     if not isinstance(definitions, dict):
         raise SeedanceError("静态视觉覆盖 subject_definitions 必须是对象。")
@@ -450,6 +454,23 @@ def validate_static_visual_overrides(body: dict[str, Any]) -> dict[str, Any]:
         ):
             raise SeedanceError(f"静态视觉覆盖主体定义无效：{normalized_label}")
         normalized_definitions[normalized_label] = definition
+
+    aliases = body.get("subject_aliases", {})
+    if not isinstance(aliases, dict):
+        raise SeedanceError("静态视觉覆盖 subject_aliases 必须是对象。")
+    normalized_aliases: dict[str, str] = {}
+    for source, target in aliases.items():
+        normalized_source = str(source).strip()
+        normalized_target = str(target).strip()
+        if not re.fullmatch(r"<[^<>]+>", normalized_source) or not re.fullmatch(
+            r"<[^<>]+>", normalized_target
+        ):
+            raise SeedanceError("静态视觉覆盖主体别名必须使用 <主体> 标签。")
+        if normalized_source == normalized_target:
+            raise SeedanceError(f"静态视觉覆盖主体别名不能指向自身：{normalized_source}")
+        normalized_aliases[normalized_source] = normalized_target
+    if any(target in normalized_aliases for target in normalized_aliases.values()):
+        raise SeedanceError("静态视觉覆盖主体别名不支持链式或循环映射。")
 
     shot_overrides = body.get("shot_overrides")
     if not isinstance(shot_overrides, list):
@@ -490,8 +511,9 @@ def validate_static_visual_overrides(body: dict[str, Any]) -> dict[str, Any]:
     if not normalized_definitions and not normalized_shots:
         raise SeedanceError("静态视觉覆盖不能为空。")
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "subject_definitions": normalized_definitions,
+        "subject_aliases": normalized_aliases,
         "shot_overrides": normalized_shots,
     }
 

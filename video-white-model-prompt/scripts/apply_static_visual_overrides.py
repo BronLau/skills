@@ -22,6 +22,7 @@ from seedance_video_pipeline import (
     validate_static_visual_overrides,
 )
 from verified_video_prompt_reverse import (
+    VISUAL_FIELDS,
     definitions_from_bindings,
     render_prompt,
     validate_facts,
@@ -77,6 +78,77 @@ def audio_override_map(value: Any) -> dict[tuple[int, int], str]:
     return result
 
 
+def replace_subject_labels(value: str, aliases: dict[str, str]) -> str:
+    updated = value
+    for source in sorted(aliases, key=len, reverse=True):
+        updated = updated.replace(source, aliases[source])
+    return updated
+
+
+def apply_subject_aliases(
+    facts: dict[str, Any],
+    bindings: dict[str, list[int]],
+    aliases: dict[str, str],
+    definitions: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, list[int]]]:
+    if not aliases:
+        return copy.deepcopy(facts), copy.deepcopy(bindings)
+    source_labels = {str(subject["label"]) for subject in facts["subjects"]}
+    unknown = sorted(set(aliases) - source_labels)
+    if unknown:
+        raise SeedanceError("静态视觉覆盖主体别名引用了不存在的主体：" + ", ".join(unknown))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for subject in facts["subjects"]:
+        target = aliases.get(str(subject["label"]), str(subject["label"]))
+        if target not in grouped:
+            grouped[target] = []
+            order.append(target)
+        grouped[target].append(subject)
+    for target, subjects in grouped.items():
+        if len(subjects) > 1 and target not in definitions:
+            raise SeedanceError(f"合并人物标签必须提供目标静态定义：{target}")
+
+    updated = copy.deepcopy(facts)
+    merged_subjects: list[dict[str, Any]] = []
+    for target in order:
+        subjects = grouped[target]
+        kinds = {str(subject["kind"]) for subject in subjects}
+        kind = "character" if "character" in kinds else str(subjects[0]["kind"])
+        description = (
+            "由用户批准的统一静态人物身份"
+            if len(subjects) > 1
+            else str(subjects[0]["original_static_description"])
+        )
+        merged_subjects.append(
+            {
+                "label": target,
+                "kind": kind,
+                "original_static_description": description,
+            }
+        )
+    updated["subjects"] = merged_subjects
+    for segment in updated["segments"]:
+        for shot in segment["shots"]:
+            for field in VISUAL_FIELDS:
+                shot[field] = replace_subject_labels(str(shot[field]), aliases)
+            for beat in shot["beats"]:
+                beat["action"] = replace_subject_labels(
+                    str(beat["action"]), aliases
+                )
+
+    merged_bindings: dict[str, list[int]] = {}
+    for label, refs in bindings.items():
+        target = aliases.get(label, label)
+        target_refs = merged_bindings.setdefault(target, [])
+        for ref in refs:
+            if ref not in target_refs:
+                target_refs.append(ref)
+    for subject in merged_subjects:
+        merged_bindings.setdefault(str(subject["label"]), [])
+    return updated, merged_bindings
+
+
 def apply_overrides(
     facts: dict[str, Any],
     definitions: dict[str, str],
@@ -90,7 +162,9 @@ def apply_overrides(
             raise SeedanceError(f"静态视觉覆盖引用了不存在的主体：{label}")
         existing = updated_definitions[label]
         updated_definitions[label] = (
-            existing + "\n" + definition if "@图片" in existing else definition
+            existing + "\n" + definition
+            if "@图片" in existing and "@图片" not in definition
+            else definition
         )
 
     shots = {
@@ -136,6 +210,12 @@ def main() -> int:
         int(segment_plan["segment_max_seconds"]),
     )
     bindings = binding_map(verification.get("appearance_bindings"))
+    facts, bindings = apply_subject_aliases(
+        facts,
+        bindings,
+        overrides["subject_aliases"],
+        overrides["subject_definitions"],
+    )
     definitions = definitions_from_bindings(facts, bindings)
     updated_facts, updated_definitions = apply_overrides(
         facts, definitions, overrides

@@ -55,6 +55,56 @@ VISUAL_FIELDS = (
     "entry_exit",
     "scene_light",
 )
+
+CORRECTION_PATH_CONTRACT = {
+    "subjects": {
+        "when": "主体清单或任一主体静态描述变化",
+        "path": "subjects",
+        "value_shape": "完整 subjects 数组",
+    },
+    "shot_plan": {
+        "when": "段内镜头数量、顺序、start_seconds 或 end_seconds 变化",
+        "path": "segments[i].shot_plan",
+        "value_shape": "完整镜头计划数组，每项只含 index、start_seconds、end_seconds",
+        "value_fields": ["index", "start_seconds", "end_seconds"],
+        "forbidden_paths": [
+            "segments[i].shots[j].start_seconds",
+            "segments[i].shots[j].end_seconds",
+        ],
+    },
+    "shot_visuals": {
+        "when": "shot_plan 变化且镜头视觉字段或 beats 同时变化",
+        "path": "segments[i].shot_visuals",
+        "value_shape": "完整镜头视觉数组，不含 index、起止时间或 audio",
+        "value_fields": [*VISUAL_FIELDS, "beats"],
+    },
+    "shot_field": {
+        "when": "shot_plan 不变，仅单个镜头视觉字段变化",
+        "path": "segments[i].shots[j].<visual_field>",
+        "value_shape": "该字段的完整原值与修正值",
+    },
+    "beat_plan": {
+        "when": "shot_plan 不变，但镜头内 beat 数量、顺序或时间区间变化",
+        "path": "segments[i].shots[j].beat_plan",
+        "value_shape": "完整 beat 计划数组",
+    },
+    "beat_actions": {
+        "when": "beat_plan 变化且动作集合同时变化",
+        "path": "segments[i].shots[j].beat_actions",
+        "value_shape": "完整 beat action 数组",
+    },
+}
+TIMELINE_CONTRACT = {
+    "time_type": "JSON整数",
+    "applies_to": [
+        "segments[i].shots[j].start_seconds",
+        "segments[i].shots[j].end_seconds",
+        "segments[i].shots[j].beats[k].start_seconds",
+        "segments[i].shots[j].beats[k].end_seconds",
+    ],
+    "continuity": "镜头连续覆盖完整分段，beats 连续覆盖完整镜头，无缺口或重叠",
+    "fractional_seconds_allowed": False,
+}
 QUALITY_CONSTRAINT = (
     "全片约束：人物、产品与场景外观全程保持一致。"
     "不要字幕、叠加文字、乱码或平台水印；"
@@ -394,6 +444,24 @@ def evidence_times(start: float, end: float, source_duration: float) -> tuple[fl
     return tuple(dict.fromkeys(round(value, 3) for value in values))
 
 
+def aggregate_segment_evidence_times(
+    segment: dict[str, Any],
+    source_duration: float,
+) -> tuple[float, ...]:
+    segment_start = float(segment["source_start_seconds"])
+    segment_end = float(segment["source_end_seconds"])
+    values = set(evidence_times(segment_start, segment_end, source_duration))
+    for shot in segment["shots"]:
+        shot_start = segment_start + float(shot["start_seconds"])
+        shot_end = segment_start + float(shot["end_seconds"])
+        values.update(evidence_times(shot_start, shot_end, source_duration))
+        for beat in shot.get("beats") or []:
+            beat_start = segment_start + float(beat["start_seconds"])
+            beat_end = segment_start + float(beat["end_seconds"])
+            values.update(evidence_times(beat_start, beat_end, source_duration))
+    return tuple(sorted(values))
+
+
 def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[str, list[float]]:
     result: dict[str, list[float]] = {}
     for segment_pos, segment in enumerate(facts["segments"]):
@@ -404,8 +472,11 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
             evidence_times(segment_start, segment_end, source_duration)
         )
         result[segment_path] = segment_allowed
-        result[segment_path + ".shot_plan"] = segment_allowed
-        result[segment_path + ".shot_visuals"] = segment_allowed
+        aggregate_allowed = list(
+            aggregate_segment_evidence_times(segment, source_duration)
+        )
+        result[segment_path + ".shot_plan"] = aggregate_allowed
+        result[segment_path + ".shot_visuals"] = aggregate_allowed
         for shot_pos, shot in enumerate(segment["shots"]):
             start = segment_start + float(shot["start_seconds"])
             end = segment_start + float(shot["end_seconds"])
@@ -465,7 +536,10 @@ def visual_differences(
             for shot in verified_segment["shots"]
         ]
         if omni_plan != verified_plan:
-            allowed = evidence_times(source_offset, source_end, source_duration)
+            allowed = aggregate_segment_evidence_times(
+                omni_segment,
+                source_duration,
+            )
             differences[f"segments[{segment_pos}].shot_plan"] = (
                 omni_plan,
                 verified_plan,
@@ -592,7 +666,11 @@ def validate_corrections(
             raise ScriptError(f"Max correction 路径无对应事实变化或重复：{path}")
         expected_before, expected_after, allowed_times = differences[path]
         if before != expected_before or after != expected_after:
-            raise ScriptError(f"Max correction 的原值或修正值与事实差异不一致：{path}")
+            raise ScriptError(
+                "Max correction 的原值或修正值与事实差异不一致："
+                f"{path}；必须严格使用 correction_path_contract 的 value_fields，"
+                "不能增加其他字段。"
+            )
         if not isinstance(evidence, list) or not evidence or not description:
             raise ScriptError(f"Max correction 缺少时间证据或说明：{path}")
         if any(isinstance(value, bool) for value in evidence):
@@ -976,6 +1054,8 @@ def build_max_messages(
     context = {
         "omni_source_facts": omni,
         "allowed_evidence_times": evidence_time_index(omni, source_duration),
+        "correction_path_contract": CORRECTION_PATH_CONTRACT,
+        "timeline_contract": TIMELINE_CONTRACT,
         "available_image_count": number - 1,
         "product_name": args.product_name.strip(),
         "selling_points": args.selling_points.strip(),
@@ -1267,6 +1347,14 @@ def main() -> int:
                         "role": "user",
                         "content": (
                             f"机器校验失败：{error}\n重新查看原片，完整输出修复 JSON。"
+                            "corrections 必须遵循用户上下文 correction_path_contract："
+                            "镜头数量、顺序或起止时间变化统一使用 segments[i].shot_plan，"
+                            "相关视觉同步变化使用 segments[i].shot_visuals，"
+                            "shot_visuals 每项只含 correction_path_contract.value_fields，"
+                            "不得额外放入 index、起止时间或 audio；"
+                            "严格执行 timeline_contract，所有镜头与 beat 的起止时间必须是"
+                            " JSON 整数并连续完整覆盖，禁止任何小数秒；"
+                            "不得使用单个 start_seconds 或 end_seconds 路径，也不得申报无实际差异的字段。"
                             "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
                             "audio_overrides 非空时，每项必须且只能包含整数"
                             " segment_index、整数 shot_index 和字符串 audio；audio"

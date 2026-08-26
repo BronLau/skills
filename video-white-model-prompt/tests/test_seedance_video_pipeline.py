@@ -1699,6 +1699,42 @@ class SeedancePipelineTests(unittest.TestCase):
                 }
             )
 
+    def test_static_visual_overrides_accept_restricted_subject_aliases(self) -> None:
+        normalized = MODULE.validate_static_visual_overrides(
+            {
+                "schema_version": 2,
+                "subject_definitions": {
+                    "<角色卡人物>": "将角色卡中的短发人物定义为<角色卡人物>。"
+                },
+                "subject_aliases": {
+                    "<高马尾模特>": "<角色卡人物>",
+                    "<短发模特>": "<角色卡人物>",
+                },
+                "shot_overrides": [],
+            }
+        )
+
+        self.assertEqual(
+            normalized["subject_aliases"]["<高马尾模特>"],
+            "<角色卡人物>",
+        )
+
+    def test_static_visual_overrides_reject_alias_chains(self) -> None:
+        with self.assertRaisesRegex(MODULE.SeedanceError, "链式或循环"):
+            MODULE.validate_static_visual_overrides(
+                {
+                    "schema_version": 2,
+                    "subject_definitions": {
+                        "<角色卡人物>": "将角色卡中的短发人物定义为<角色卡人物>。"
+                    },
+                    "subject_aliases": {
+                        "<高马尾模特>": "<短发模特>",
+                        "<短发模特>": "<角色卡人物>",
+                    },
+                    "shot_overrides": [],
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

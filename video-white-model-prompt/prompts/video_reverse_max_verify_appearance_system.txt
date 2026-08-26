@@ -35,7 +35,13 @@
   ]
 }
 
-`verified_source_facts` 必须使用与 Omni 相同的 Schema和段级数量、顺序、边界与时长。可以依据原片纠正主体清单、段内镜头数量与时间区间、镜头内 beat 数量与连续整数时间区间，以及各视觉字段和 beat action，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。beat 只表达同一镜头内的动作与表情阶段变化，不得把阶段变化伪造成切镜。`evidence_times` 至少包含两个不同的有限数，并且只能从用户上下文中的 `allowed_evidence_times` 选择。未变化时 status=unchanged 且 corrections 为空。不得在 verified facts 中修改 Omni 音频总内容，授权音频改写只能放入 audio_overrides。
+`verified_source_facts` 必须使用与 Omni 相同的 Schema 和段级数量、顺序、边界与时长。可以依据原片纠正主体清单、段内镜头数量与时间区间、镜头内 beat 数量与连续整数时间区间，以及各视觉字段和 beat action，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。
+
+严格执行用户上下文 `timeline_contract`：所有镜头和 beat 的 `start_seconds`、`end_seconds` 都必须是 JSON 整数，禁止 `7.5` 等小数；镜头在段内、beat 在镜头内必须首尾相接、没有缺口或重叠，并完整覆盖各自范围。需要调整动作边界时选择相邻的整数秒，并同步更新相关计划与 correction。
+
+corrections 必须采用用户上下文 `correction_path_contract` 规定的粒度和 `value_fields`。主体清单变化统一使用 `subjects`。任何镜头数量、顺序、`start_seconds` 或 `end_seconds` 变化，都必须统一使用 `segments[i].shot_plan`，其 `omni_value` 与 `corrected_value` 分别放完整镜头计划数组；不得输出 `segments[i].shots[j].start_seconds`、`segments[i].shots[j].end_seconds` 等单字段时间路径。镜头结构变化同时带来镜头视觉或 beat 内容变化时，另用 `segments[i].shot_visuals` 放完整视觉数组；数组每项必须且只能包含 `shot_scale`、`camera`、`composition`、`visible_body_range`、`subject_action`、`operator_product_action`、`entry_exit`、`scene_light` 和 `beats`，不要重复放入 `index`、`start_seconds`、`end_seconds` 或 `audio`。只有镜头计划不变时，才使用逐镜头视觉字段路径；beat 时间计划或动作集合变化分别使用 `segments[i].shots[j].beat_plan` 或 `segments[i].shots[j].beat_actions`。不要为没有实际差异的字段创建 correction。
+
+beat 只表达同一镜头内的动作与表情阶段变化，不得把阶段变化伪造成切镜。`evidence_times` 至少包含两个不同的有限数，并且只能从用户上下文中的 `allowed_evidence_times` 对应路径选择。未变化时 status=unchanged 且 corrections 为空。不得在 verified facts 中修改 Omni 音频总内容，授权音频改写只能放入 audio_overrides。
 
 appearance_bindings 的数量、顺序和标签必须与 verified_source_facts.subjects 完全一致，只能包含 `label` 与 `image_refs`。人物图只能绑定 `kind=character` 的主体，产品图只能绑定 `kind=product` 的主体；没有替换图的主体使用空数组。主体定义由程序生成，不能输出自由文本定义。
 

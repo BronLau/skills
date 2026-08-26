@@ -2,7 +2,7 @@
 name: video-white-model-prompt
 description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；支持人物图参考，以及经权利人授权的 2–15 秒人声音色参考。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
 metadata:
-  version: 1.14.0
+  version: 1.14.4
 ---
 
 # 视频白模、提示词反推与 Seedance 成片
@@ -134,9 +134,9 @@ python3 <skill-root>/scripts/run_pipeline.py \
 
 Omni 结构化事实必须使用最少分段数，以整数秒连续覆盖完整目标时长；段内镜头编号和时间轴连续。每个镜头的 `beats` 使用段内相对整数时间，连续覆盖该镜头；动作、表情、操作人员或产品动作发生阶段变化时拆分 beat，但不得虚构切镜。存在人声时逐字写入 `{}`，没有可辨识人声时设置 `no_speech_confirmed=true`。人物图、产品图、名称、卖点和创意不发送给 Omni，避免替换素材污染原片动作理解。Omni JSON 不通过时携带具体错误定向修复一次，仍失败则停止。
 
-Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序、边界、时长和音频总内容；可以依据原片纠正主体清单、段内镜头与 beat 的数量、顺序、连续整数时间区间及视觉字段，但每类变化都必须在 `fact_review.corrections` 中逐项写明字段路径、完整 Omni 原值、完整修正值、证据时间和证据说明。证据时间至少包含两个不同的有限数，并且只能取程序预先提供的 beat、镜头或段级起点、中点、终点。任何未解释的事实变化、越权字段、NaN/Infinity 或无对应时间证据的修改都会被机器拒绝。
+Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序、边界、时长和音频总内容；可以依据原片纠正主体清单、段内镜头与 beat 的数量、顺序、连续整数时间区间及视觉字段，但每类变化都必须在 `fact_review.corrections` 中逐项写明字段路径、完整 Omni 原值、完整修正值、证据时间和证据说明。correction 路径与校验粒度保持一致：主体清单变化使用 `subjects`；镜头数量、顺序或起止时间变化使用 `segments[i].shot_plan`，并以完整镜头计划数组作为原值和修正值，不得拆成单个 `start_seconds` 或 `end_seconds` 路径；镜头结构变化同时带来视觉内容变化时另用 `segments[i].shot_visuals`，其数组项只包含允许的视觉字段和 `beats`，不重复包含 `index`、起止时间或 `audio`；镜头结构不变时才使用逐镜头视觉字段路径，beat 计划或动作集合变化分别使用 `beat_plan` 或 `beat_actions`。聚合镜头修正可以从程序为该段汇总的段、镜头和 beat 起点、中点、终点中选取证据；每项证据时间至少包含两个不同的有限数，并且必须来自对应 correction 路径的 `allowed_evidence_times`。任何未解释的事实变化、越权字段、NaN/Infinity 或无对应时间证据的修改都会被机器拒绝。
 
-人物图和产品图只进入结构化 `appearance_bindings`，每项只能包含主体标签和图片编号数组，不允许 Max 输出自由文本主体定义。人物图只能绑定 `kind=character`，产品图只能绑定 `kind=product`，每张图片只能绑定一个主体；程序为每张图片生成逐项素材绑定，明确对应主体、只参考的静态外观维度以及不参考的姿态、动作、景别、机位或拼版布局。因此替换素材不能通过定义文本夹带动作、姿态变化、景别、运镜、身体可见范围或进出场。
+人物图和产品图只进入结构化 `appearance_bindings`，每项只能包含主体标签和图片编号数组，不允许 Max 输出自由文本主体定义。人物图只能绑定 `kind=character`，产品图只能绑定 `kind=product`，每张图片只能绑定一个主体；程序为每张图片生成逐项素材绑定，明确对应主体、只参考的静态外观维度以及不参考的姿态、动作、景别、机位或拼版布局。因此替换素材不能通过定义文本夹带动作、姿态变化、景别、运镜、身体可见范围或进出场。用户在事实锁之后明确要求多个原片人物统一为同一人物形象时，不让 Max 重写动作事实，而是使用受限静态覆盖把这些人物标签合并为一个中性目标标签，再把人物图绑定到该目标标签；原标签中的发型、服装等外观词不得继续进入正式 Prompt。
 
 默认音频直接采用 Omni 事实；指定词替换由程序确定性执行；只有用户明确允许整段改写时，Max 才能通过 `audio_overrides` 修改对应镜头音频。每个音频覆盖项必须且只能包含整数 `segment_index`、整数 `shot_index` 和完整字符串 `audio`，并指向已存在的镜头。改写后的声音描述必须自包含且可直接执行，不得引用不会提交给 Seedance 的原片、原视频、原始音轨、原曲或参考视频。最终 Prompt 由程序使用 Max 核验事实、静态外观绑定和授权音频覆盖确定性组装，Max 无法在组装阶段新增镜头动作。
 
@@ -162,7 +162,7 @@ Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序
 
 选择 2 时，先确认 `seedance/tasks.json` 不存在，或其中 `uploads`、`segments` 均为空；已有上传记录或任务 ID 时不覆盖原计划。确认尚未提交后，复用原 `prompt.txt`、`segment_plan.json`、原片、图片和白模目录，重新运行 `seedance_video_pipeline.py prepare --overwrite`，只替换用户修改的参数；未明确修改的参数和原 Seed 保持不变。重建并校验 `seedance_plan.json` 后，重新展示第二次确认。
 
-用户在尚未上传或创建任务时明确要求修改人物静态服饰、场景或构图的，不能直接手改已锁定 Prompt。把用户确认后的覆盖项写入独立 JSON，并使用 `scripts/apply_static_visual_overrides.py` 重建 Prompt 和事实锁；覆盖范围只允许主体静态定义以及逐镜头 `composition`、`scene_light`，不得改变动作、景别、机位、运镜、进出场、时间轴或音频。随后按原参数重新运行 `seedance_video_pipeline.py prepare --overwrite`，校验新计划并再次展示第二次确认。
+用户在尚未上传或创建任务时明确要求修改人物静态服饰、场景或构图的，不能直接手改已锁定 Prompt。把用户确认后的覆盖项写入独立 JSON，并使用 `scripts/apply_static_visual_overrides.py` 重建 Prompt 和事实锁；覆盖范围只允许主体静态定义、受限 `subject_aliases` 以及逐镜头 `composition`、`scene_light`，不得改变动作、景别、机位、运镜、进出场、时间轴或音频。`subject_aliases` 只用于把用户指定的多个人物标签合并成一个中性人物标签；合并目标必须提供显式静态定义，程序同步替换视觉事实中的标签并合并图片绑定，不修改音频。已有上传记录或任务 ID 时不得覆盖原计划，必须在独立输出目录创建新计划。随后按原参数重新运行 `seedance_video_pipeline.py prepare --overwrite`，校验新计划并再次展示第二次确认。
 
 ```bash
 python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
