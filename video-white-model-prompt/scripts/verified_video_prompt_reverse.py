@@ -56,8 +56,12 @@ VISUAL_FIELDS = (
     "scene_light",
 )
 QUALITY_CONSTRAINT = (
-    "真实摄影质感，避免生成字幕、乱码文字、叠加文案或平台水印。"
-    "人物、产品与场景外观全程保持一致，不生成未提供的品牌、包装文字或标识。"
+    "全片约束：人物、产品与场景外观全程保持一致。"
+    "不要字幕、叠加文字、乱码或平台水印；"
+    "不新增未提供的品牌、包装文字或标识。"
+)
+UNAVAILABLE_AUDIO_REFERENCE_PATTERN = re.compile(
+    r"原片|原视频|原始音轨|原曲|参考视频"
 )
 
 
@@ -180,6 +184,85 @@ def integer(value: Any, label: str) -> int:
     return int(rounded)
 
 
+def normalize_beats(
+    value: Any,
+    shot_start: int,
+    shot_end: int,
+    default_action: str,
+    label: str,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return [
+            {
+                "index": 1,
+                "start_seconds": shot_start,
+                "end_seconds": shot_end,
+                "action": default_action,
+            }
+        ]
+    if not isinstance(value, list) or not value:
+        raise ScriptError(f"{label} beats 必须是非空数组。")
+    normalized: list[dict[str, Any]] = []
+    cursor = shot_start
+    for beat_index, beat in enumerate(value, start=1):
+        if not isinstance(beat, dict):
+            raise ScriptError(f"{label} 第 {beat_index} 个 beat 无效。")
+        index = integer(beat.get("index"), f"{label} beat index")
+        start = integer(
+            beat.get("start_seconds"),
+            f"{label} beat start_seconds",
+        )
+        end = integer(
+            beat.get("end_seconds"),
+            f"{label} beat end_seconds",
+        )
+        action = str(beat.get("action") or "").strip()
+        if (
+            index != beat_index
+            or start != cursor
+            or end <= start
+            or not action
+            or "{" in action
+            or "}" in action
+        ):
+            raise ScriptError(f"{label} 第 {beat_index} 个 beat 无效或不连续。")
+        normalized.append(
+            {
+                "index": index,
+                "start_seconds": start,
+                "end_seconds": end,
+                "action": action,
+            }
+        )
+        cursor = end
+    if cursor != shot_end:
+        raise ScriptError(f"{label} beats 未覆盖完整镜头时长。")
+    return normalized
+
+
+def default_beat_action(shot: dict[str, Any]) -> str:
+    value = "；".join(
+        str(item).strip()
+        for item in (
+            shot.get("subject_action"),
+            shot.get("operator_product_action"),
+        )
+        if str(item or "").strip() not in {"", "无", "没有", "无操作"}
+    )
+    return value or "主体状态保持不变"
+
+
+def uses_summary_beat(shot: dict[str, Any]) -> bool:
+    beats = shot.get("beats")
+    return bool(
+        isinstance(beats, list)
+        and len(beats) == 1
+        and int(beats[0]["start_seconds"]) == int(shot["start_seconds"])
+        and int(beats[0]["end_seconds"]) == int(shot["end_seconds"])
+        and str(beats[0]["action"]) == default_beat_action(shot)
+    )
+
+
 def validate_facts(
     body: dict[str, Any],
     duration_seconds: int,
@@ -251,6 +334,13 @@ def validate_facts(
                         f"第 {segment_index} 段镜头 {shot_index} 的 {field} 无效。"
                     )
                 normalized_shot[field] = value
+            normalized_shot["beats"] = normalize_beats(
+                shot.get("beats"),
+                shot_start,
+                shot_end,
+                default_beat_action(normalized_shot),
+                f"第 {segment_index} 段镜头 {shot_index}",
+            )
             audio = str(shot.get("audio") or "").strip()
             if audio.count("{") != audio.count("}"):
                 raise ScriptError(f"第 {segment_index} 段镜头音频大括号不配对。")
@@ -309,15 +399,27 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
     for segment_pos, segment in enumerate(facts["segments"]):
         segment_start = float(segment["source_start_seconds"])
         segment_end = float(segment["source_end_seconds"])
-        result[f"segments[{segment_pos}]"] = list(
+        segment_path = f"segments[{segment_pos}]"
+        segment_allowed = list(
             evidence_times(segment_start, segment_end, source_duration)
         )
+        result[segment_path] = segment_allowed
+        result[segment_path + ".shot_plan"] = segment_allowed
+        result[segment_path + ".shot_visuals"] = segment_allowed
         for shot_pos, shot in enumerate(segment["shots"]):
             start = segment_start + float(shot["start_seconds"])
             end = segment_start + float(shot["end_seconds"])
-            result[f"segments[{segment_pos}].shots[{shot_pos}]"] = list(
-                evidence_times(start, end, source_duration)
-            )
+            shot_path = f"segments[{segment_pos}].shots[{shot_pos}]"
+            shot_allowed = list(evidence_times(start, end, source_duration))
+            result[shot_path] = shot_allowed
+            result[shot_path + ".beat_plan"] = shot_allowed
+            result[shot_path + ".beat_actions"] = shot_allowed
+            for beat_pos, beat in enumerate(shot.get("beats") or []):
+                beat_start = segment_start + float(beat["start_seconds"])
+                beat_end = segment_start + float(beat["end_seconds"])
+                result[
+                    shot_path + f".beats[{beat_pos}]"
+                ] = list(evidence_times(beat_start, beat_end, source_duration))
     return result
 
 
@@ -370,11 +472,17 @@ def visual_differences(
                 allowed,
             )
             omni_visuals = [
-                {field: shot[field] for field in VISUAL_FIELDS}
+                {
+                    **{field: shot[field] for field in VISUAL_FIELDS},
+                    "beats": shot["beats"],
+                }
                 for shot in omni_segment["shots"]
             ]
             verified_visuals = [
-                {field: shot[field] for field in VISUAL_FIELDS}
+                {
+                    **{field: shot[field] for field in VISUAL_FIELDS},
+                    "beats": shot["beats"],
+                }
                 for shot in verified_segment["shots"]
             ]
             if omni_visuals != verified_visuals:
@@ -389,6 +497,63 @@ def visual_differences(
         ):
             if omni_shot["audio"] != verified_shot["audio"]:
                 raise ScriptError("Max 不得修改 Omni 音频事实；音频改写走 audio_overrides。")
+            shot_start = source_offset + float(omni_shot["start_seconds"])
+            shot_end = source_offset + float(omni_shot["end_seconds"])
+            compare_beats = not (
+                uses_summary_beat(omni_shot) and uses_summary_beat(verified_shot)
+            )
+            omni_beat_plan = [
+                {
+                    "index": beat["index"],
+                    "start_seconds": beat["start_seconds"],
+                    "end_seconds": beat["end_seconds"],
+                }
+                for beat in omni_shot["beats"]
+            ]
+            verified_beat_plan = [
+                {
+                    "index": beat["index"],
+                    "start_seconds": beat["start_seconds"],
+                    "end_seconds": beat["end_seconds"],
+                }
+                for beat in verified_shot["beats"]
+            ]
+            if compare_beats and omni_beat_plan != verified_beat_plan:
+                differences[
+                    f"segments[{segment_pos}].shots[{shot_pos}].beat_plan"
+                ] = (
+                    omni_beat_plan,
+                    verified_beat_plan,
+                    evidence_times(shot_start, shot_end, source_duration),
+                )
+                omni_actions = [beat["action"] for beat in omni_shot["beats"]]
+                verified_actions = [
+                    beat["action"] for beat in verified_shot["beats"]
+                ]
+                if omni_actions != verified_actions:
+                    differences[
+                        f"segments[{segment_pos}].shots[{shot_pos}].beat_actions"
+                    ] = (
+                        omni_actions,
+                        verified_actions,
+                        evidence_times(shot_start, shot_end, source_duration),
+                    )
+            elif compare_beats:
+                for beat_pos, (omni_beat, verified_beat) in enumerate(
+                    zip(omni_shot["beats"], verified_shot["beats"])
+                ):
+                    if omni_beat["action"] == verified_beat["action"]:
+                        continue
+                    beat_start = source_offset + float(omni_beat["start_seconds"])
+                    beat_end = source_offset + float(omni_beat["end_seconds"])
+                    differences[
+                        f"segments[{segment_pos}].shots[{shot_pos}]."
+                        f"beats[{beat_pos}].action"
+                    ] = (
+                        omni_beat["action"],
+                        verified_beat["action"],
+                        evidence_times(beat_start, beat_end, source_duration),
+                    )
             for field in VISUAL_FIELDS:
                 before = omni_shot[field]
                 after = verified_shot[field]
@@ -530,15 +695,23 @@ def definitions_from_bindings(
             )
             continue
         noun = "人物" if subject["kind"] == "character" else "产品"
-        first = refs[0]
-        if len(refs) == 1:
-            definitions[label] = f"参考@图片{first}中的{noun}外观，将其定义为{label}。"
-        else:
-            joined = "、".join(f"@图片{ref}" for ref in refs)
-            definitions[label] = (
-                f"参考@图片{first}中由{joined}共同展示的同一{noun}外观，"
-                f"将其定义为{label}。"
+        joined = "、".join(f"@图片{ref}" for ref in refs)
+        if noun == "人物":
+            reference_scope = (
+                "只参考人物的面部、发型、体型、服装和配饰等静态外观，"
+                "不参考图片中的姿态、动作、景别、机位或拼版布局；"
+                "若素材包含同一人物的多视图或拼版，各视图共同定义同一主体，"
+                "不生成多个副本"
             )
+        else:
+            reference_scope = (
+                "只参考产品的外形、颜色、材质、包装和已有标识等静态外观，"
+                "不参考图片中的手持动作、构图、景别或场景"
+            )
+        definitions[label] = (
+            f"{joined}是{label}的静态外观参考；{reference_scope}；"
+            f"全文统一称为{label}。"
+        )
     return definitions
 
 
@@ -565,8 +738,19 @@ def validate_audio_overrides(
             integer(item.get("shot_index"), "audio shot_index"),
         )
         audio = str(item.get("audio") or "").strip()
-        if key not in shots or key in result or audio.count("{") != audio.count("}"):
+        if (
+            key not in shots
+            or key in result
+            or not audio
+            or audio.count("{") != audio.count("}")
+        ):
             raise ScriptError(f"Max audio override 无效：{key}")
+        unavailable = UNAVAILABLE_AUDIO_REFERENCE_PATTERN.search(audio)
+        if unavailable:
+            raise ScriptError(
+                "Max audio override 引用了不会提交给 Seedance 的原始媒体："
+                f"{unavailable.group(0)}"
+            )
         result[key] = audio
     return result
 
@@ -620,18 +804,38 @@ def timecode(seconds: int) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-def render_shot(shot: dict[str, Any], audio: str) -> str:
+def render_segment_overview(
+    facts: dict[str, Any],
+    segment: dict[str, Any],
+) -> str:
+    labels = [
+        subject["label"]
+        for subject in facts["subjects"]
+        if subject["kind"] != "scene"
+    ]
+    subject_text = "、".join(labels) or "画面主体"
+    shots = segment["shots"]
+    if len(shots) == 1:
+        shot = shots[0]
+        return (
+            f"生成目标：在{shot['scene_light']}中，以{shot['shot_scale']}、"
+            f"{shot['camera']}呈现{subject_text}的连续动作与互动，"
+            "保持真实摄影质感。"
+        )
+    return (
+        f"生成目标：严格按下方时间轴呈现{subject_text}的连续动作、"
+        "场景和镜头变化，保持真实摄影质感。"
+    )
+
+
+def render_shot_static(shot: dict[str, Any]) -> str:
     parts = [
         f"{shot['shot_scale']}，{shot['camera']}",
         shot["composition"],
         f"画面可见范围：{shot['visible_body_range']}",
-        shot["subject_action"],
-        shot["operator_product_action"],
         shot["entry_exit"],
         shot["scene_light"],
     ]
-    if audio:
-        parts.append(audio)
     return "。".join(part.strip().rstrip("。") for part in parts if part.strip()) + "。"
 
 
@@ -652,16 +856,25 @@ def render_prompt(
                 f"{segment['source_end_seconds']}秒）】"
             )
         lines.append(definition_block)
+        lines.append(render_segment_overview(facts, segment))
         for shot in segment["shots"]:
             lines.append(
                 f"镜头{shot['index']}[{timecode(shot['start_seconds'])}-"
                 f"{timecode(shot['end_seconds'])}]"
             )
+            lines.append("画面：" + render_shot_static(shot))
+            for beat in shot["beats"]:
+                lines.append(
+                    f"动作阶段{beat['index']}[{timecode(beat['start_seconds'])}-"
+                    f"{timecode(beat['end_seconds'])}]："
+                    f"{str(beat['action']).rstrip('。')}。"
+                )
             audio = audio_overrides.get(
                 (int(segment["index"]), int(shot["index"])),
                 str(shot["audio"]),
             )
-            lines.append(render_shot(shot, audio))
+            if audio:
+                lines.append("声音：" + audio.rstrip("。") + "。")
         lines.append(QUALITY_CONSTRAINT)
         sections.append("\n".join(lines))
     return "\n\n".join(sections).strip()
@@ -750,7 +963,9 @@ def build_max_messages(
             "允许通过 audio_overrides 改写音频；视觉事实仍只按原片核验。"
             "每项必须且只能使用 {\"segment_index\": JSON整数, "
             "\"shot_index\": JSON整数, \"audio\": \"完整替换音频描述\"}，"
-            "并指向已存在的镜头，不得省略索引。"
+            "并指向已存在的镜头，不得省略索引。audio 必须是 Seedance 可独立"
+            "执行的具体声音描述，不得引用不会提交给 Seedance 的原片、原视频、"
+            "原始音轨、原曲或参考视频。"
         )
     elif replacements:
         audio_permission = "audio_overrides 必须为空；程序将执行：" + "；".join(
@@ -1054,7 +1269,8 @@ def main() -> int:
                             f"机器校验失败：{error}\n重新查看原片，完整输出修复 JSON。"
                             "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
                             "audio_overrides 非空时，每项必须且只能包含整数"
-                            " segment_index、整数 shot_index 和字符串 audio。"
+                            " segment_index、整数 shot_index 和字符串 audio；audio"
+                            " 必须自包含，不得引用不会提交给 Seedance 的原始媒体。"
                         ),
                     },
                 ],

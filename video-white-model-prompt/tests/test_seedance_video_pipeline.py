@@ -186,14 +186,45 @@ class SeedancePipelineTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertEqual(body["mode"], "depth-reference")
-            self.assertTrue(compiled.startswith("@视频1是本段细粒度深度白模参考"))
-            self.assertIn("@视频1是本段细粒度深度白模参考", compiled)
+            self.assertTrue(compiled.startswith("@视频1是本段唯一的镜头结构与运动参考"))
+            self.assertIn("不新增镜头或改变动作逻辑", compiled)
+            self.assertNotIn("@图片N", compiled)
             self.assertNotIn("生成一段全新视频", compiled)
             self.assertNotIn("【参考素材职责】", compiled)
             self.assertNotIn("@音频", compiled)
             self.assertEqual(
                 body["segments"][0]["depth_video"]["path"], str(depth.resolve())
             )
+
+    def test_compile_rejects_reference_to_unavailable_original_media(self) -> None:
+        for prompt in (
+            "镜头1[00:00-00:10] 原创 BGM 保留原片的节奏。",
+            "镜头1[00:00-00:10] 音乐节奏与参考视频保持一致。",
+        ):
+            with self.subTest(prompt=prompt):
+                with self.assertRaisesRegex(MODULE.SeedanceError, "不会提交给 Seedance"):
+                    MODULE.compile_prompt(prompt, 0, False)
+
+    def test_compile_rejects_uninstantiated_material_placeholder(self) -> None:
+        with self.assertRaisesRegex(MODULE.SeedanceError, "未实例化"):
+            MODULE.compile_prompt(
+                "人物外观以@图片N为准。镜头1[00:00-00:10] 展示。",
+                1,
+                False,
+            )
+
+    def test_white_model_does_not_override_character_identity_geometry(self) -> None:
+        compiled = MODULE.compile_prompt(
+            "@图片1是<模特>的静态外观参考；只参考人物静态外观；"
+            "全文统一称为<模特>。\n镜头1[00:00-00:10] 展示。",
+            1,
+            True,
+            False,
+            True,
+        )
+
+        self.assertIn("白模不负责人物身份、脸型、五官、发型轮廓", compiled)
+        self.assertIn("这些信息与白模几何冲突时，以绑定人物图片为准", compiled)
 
     def test_prepare_virtual_character_records_private_asset_contract(self) -> None:
         from PIL import Image

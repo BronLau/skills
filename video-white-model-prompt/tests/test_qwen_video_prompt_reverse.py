@@ -533,34 +533,24 @@ class PipelinePromptTests(unittest.TestCase):
             repair_text = repair_payload["messages"][-1]["content"]
             self.assertIn("超出本段时长", repair_text)
 
-    def test_segment_overview_is_rejected_and_repaired_by_max(self) -> None:
+    def test_structured_generation_target_is_accepted_without_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self.make_args(root)
-            invalid = (
-                "生成一条户外真实摄影风格的种草短视频，节奏轻快。\n"
+            valid = (
+                "生成目标：户外真实摄影风格，人物进行连续产品展示。\n"
                 "镜头1[00:00-00:10] 完整分镜"
             )
-            repaired = "镜头1[00:00-00:10] 户外真实摄影，节奏轻快。"
 
             code, _, max_mock = self.run_main(
                 args,
                 has_audio=True,
-                max_result=invalid,
-                max_repair_result=repaired,
+                max_result=valid,
             )
 
             self.assertEqual(code, 0)
-            self.assertEqual(max_mock.call_count, 2)
-            repair_payload = max_mock.call_args_list[1].args[2]
-            self.assertIn(
-                "镜头1前包含非主体定义内容",
-                repair_payload["messages"][-1]["content"],
-            )
-            self.assertNotIn(
-                "生成一条",
-                args.output.read_text(encoding="utf-8"),
-            )
+            self.assertEqual(max_mock.call_count, 1)
+            self.assertEqual(args.output.read_text(encoding="utf-8").strip(), valid)
 
     def test_alternative_segment_overview_is_rejected(self) -> None:
         result = (
@@ -577,6 +567,16 @@ class PipelinePromptTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIsNotNone(MODULE.DEFINITION_LINE_PATTERN.fullmatch(line))
+
+    def test_explicit_material_binding_is_valid_preamble(self) -> None:
+        result = (
+            "@图片1是<模特>的静态外观参考；只参考面部和服装，"
+            "不参考姿态或构图；全文统一称为<模特>。\n"
+            "生成目标：棚拍美妆近景，人物接受睫毛膏涂抹。\n"
+            "镜头1[00:00-00:10] 人物居中展示。"
+        )
+        plan = MODULE.validate_prompt_contract(result, 10, 10.0, 15, 1, "测试稿")
+        self.assertEqual(plan["prompt_duration_seconds"], 10)
 
     def test_omni_without_spoken_content_requires_confirmation_marker(self) -> None:
         draft = "镜头1[00:00-00:10] 轻快 BGM。"

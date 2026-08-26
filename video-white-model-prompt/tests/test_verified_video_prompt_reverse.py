@@ -141,6 +141,64 @@ class VerifiedPromptTests(unittest.TestCase):
             )
             self.assertEqual(overrides[(1, 1)], "原创无歌词流行伴奏。")
 
+            with self.assertRaisesRegex(MODULE.ScriptError, "不会提交给 Seedance"):
+                MODULE.validate_audio_overrides(
+                    [
+                        {
+                            "segment_index": 1,
+                            "shot_index": 1,
+                            "audio": "原创伴奏，保留原片节奏。",
+                        }
+                    ],
+                    self.facts(),
+                    True,
+                )
+
+    def test_beats_are_continuous_and_rendered_inside_one_shot(self) -> None:
+        body = self.facts(camera="固定机位", action="人物表情逐渐变化")
+        body["segments"][0]["shots"][0]["beats"] = [
+            {
+                "index": 1,
+                "start_seconds": 0,
+                "end_seconds": 4,
+                "action": "<模特>平静看向前方，化妆刷靠近上睫毛",
+            },
+            {
+                "index": 2,
+                "start_seconds": 4,
+                "end_seconds": 10,
+                "action": "<模特>短暂睁大眼睛，随后自然微笑",
+            },
+        ]
+        facts = MODULE.validate_facts(body, 10, 15)
+        prompt = MODULE.render_prompt(
+            facts,
+            MODULE.default_definitions(facts),
+            {},
+        )
+
+        self.assertIn("生成目标：", prompt)
+        self.assertIn("镜头1[00:00-00:10]", prompt)
+        self.assertIn("动作阶段1[00:00-00:04]", prompt)
+        self.assertIn("动作阶段2[00:04-00:10]", prompt)
+        self.assertEqual(prompt.count("镜头1["), 1)
+        self.assertIn("全片约束：", prompt)
+
+        broken = deepcopy(body)
+        broken["segments"][0]["shots"][0]["beats"][1]["start_seconds"] = 5
+        with self.assertRaisesRegex(MODULE.ScriptError, "beat 无效或不连续"):
+            MODULE.validate_facts(broken, 10, 15)
+
+    def test_image_binding_is_explicit_and_limits_reference_scope(self) -> None:
+        facts = MODULE.validate_facts(self.facts(), 10, 15)
+        definitions = MODULE.definitions_from_bindings(facts, {"<模特>": [1]})
+        definition = definitions["<模特>"]
+
+        self.assertTrue(definition.startswith("@图片1是<模特>的静态外观参考"))
+        self.assertIn("不参考图片中的姿态、动作、景别、机位或拼版布局", definition)
+        self.assertIn("各视图共同定义同一主体，不生成多个副本", definition)
+        self.assertIn("全文统一称为<模特>", definition)
+
     def test_max_correction_must_match_every_fact_difference(self) -> None:
         omni = MODULE.validate_facts(self.facts(), 10, 15)
         verified = MODULE.validate_facts(
@@ -347,6 +405,9 @@ class VerifiedPromptTests(unittest.TestCase):
             max_payload = max_mock.call_args.args[2]
             self.assertEqual(max_payload["messages"][1]["content"][0]["type"], "video_url")
             prompt = args.output.read_text(encoding="utf-8")
+            self.assertIn("@图片1是<模特>的静态外观参考", prompt)
+            self.assertIn("生成目标：", prompt)
+            self.assertIn("动作阶段1[00:00-00:10]", prompt)
             self.assertIn("固定机位", prompt)
             self.assertIn("仅轻微眨眼", prompt)
             self.assertNotIn("平稳横移", prompt)

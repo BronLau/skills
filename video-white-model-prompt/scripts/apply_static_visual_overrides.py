@@ -21,7 +21,11 @@ from seedance_video_pipeline import (
     validate_identity,
     validate_static_visual_overrides,
 )
-from verified_video_prompt_reverse import definitions_from_bindings, render_prompt
+from verified_video_prompt_reverse import (
+    definitions_from_bindings,
+    render_prompt,
+    validate_facts,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +88,10 @@ def apply_overrides(
     for label, definition in overrides["subject_definitions"].items():
         if label not in labels:
             raise SeedanceError(f"静态视觉覆盖引用了不存在的主体：{label}")
-        updated_definitions[label] = definition
+        existing = updated_definitions[label]
+        updated_definitions[label] = (
+            existing + "\n" + definition if "@图片" in existing else definition
+        )
 
     shots = {
         (int(segment["index"]), int(shot["index"])): shot
@@ -122,6 +129,12 @@ def main() -> int:
     facts = verification.get("verified_source_facts")
     if not isinstance(facts, dict):
         raise SeedanceError("Max 核验事实缺少 verified_source_facts。")
+    segment_plan = load_json(segment_plan_path, "分段计划")
+    facts = validate_facts(
+        facts,
+        int(segment_plan["prompt_duration_seconds"]),
+        int(segment_plan["segment_max_seconds"]),
+    )
     bindings = binding_map(verification.get("appearance_bindings"))
     definitions = definitions_from_bindings(facts, bindings)
     updated_facts, updated_definitions = apply_overrides(

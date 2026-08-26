@@ -77,6 +77,7 @@
 
 - 渐进式向导交互，每轮只问一项，已提供的信息自动跳过对应步骤；
 - 分段时长可选 15s（Seedance 2.0）或 30s（Seedance 2.5）；
+- 按官方 Seedance 2.5 结构确定性组装素材绑定、生成目标、镜头、镜头内动作阶段、声音和全片约束；
 - 两次确认机制：第一阶段产物确认后才收集提交配置，完整展示提交范围后才真正提交；
 - 密钥只从环境变量或本机 Key 文件读取，不要求用户在聊天中粘贴。
 
@@ -105,6 +106,6 @@ ln -s /absolute/path/to/skills/video-white-model-prompt ~/.codex/skills/video-wh
 两个视频类 Skill 需要模型 API Key，均只从环境变量或本机 Key 文件读取，不在仓库中保存任何凭证：
 
 - `video-reverse-replicate-product`：`DASHSCOPE_API_KEY`，需开通 qwen3.8-max、qwen3.5-omni-plus、qwen-image-3.0-pro、wan3.0-video；依赖 `pip install openai dashscope pillow`。
-- `video-white-model-prompt`：`DASHSCOPE_API_KEY`（Qwen）、`ARK_API_KEY`（Seedance），带白模或图片时另需火山 TOS 配置（`TOS_*` 环境变量或配置文件/目录）；依赖见 `video-white-model-prompt/requirements.txt`。
+- `video-white-model-prompt`：`DASHSCOPE_API_KEY` 用于 Qwen；Ark 配置中的 `ARK_API_KEY` 用于 Seedance，人物素材库另使用同一 Ark 配置文件中的 `accessKey`、`secretKey`；带白模或待上传素材时使用独立 TOS 配置文件，TOS 凭证仅用于 STS/TOS 上传；依赖见 `video-white-model-prompt/requirements.txt`。
 
 深度模型路径可通过 `DEPTH_ANYTHING_MODEL` 环境变量或 `--depth-model` 指定，也可放在 `video-white-model-prompt/models/` 下。

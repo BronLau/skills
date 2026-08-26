@@ -75,6 +75,9 @@ TASK_INTENT_CONFLICTS = (
     re.compile(r"续写\s*@视频\d+"),
     re.compile(r"(?:删除|去掉|修改)\s*@视频\d+"),
 )
+UNAVAILABLE_SOURCE_REFERENCE_PATTERN = re.compile(
+    r"原片|原视频|原始音轨|原曲|参考视频"
+)
 BASE_FACT_ASSEMBLY_MODE = "deterministic_from_max_verified_facts"
 STATIC_OVERRIDE_ASSEMBLY_MODE = (
     "deterministic_from_max_verified_facts_with_user_static_overrides"
@@ -822,16 +825,25 @@ def compile_prompt(
     image_count: int,
     with_depth: bool,
     with_reference_audio: bool = False,
+    with_character_image: bool = False,
 ) -> str:
     if re.search(r"@(?:视频|音频)\d+", body):
         raise SeedanceError("Max 正式稿不得预先包含 @视频N 或 @音频N 引用。")
     compiled = re.sub(r"(?<!@)图片(?P<number>\d+)", r"@图片\g<number>", body)
     compiled = compiled.replace("4K高清", "高清").replace("4K 高清", "高清")
+    if re.search(r"@(?:图片|视频|音频)N", compiled):
+        raise SeedanceError("最终提示词包含未实例化的素材占位符。")
     for pattern in TASK_INTENT_CONFLICTS:
         if pattern.search(compiled):
             raise SeedanceError(
                 "最终提示词包含视频编辑或延长意图，拒绝按参考生视频提交。"
             )
+    unavailable = UNAVAILABLE_SOURCE_REFERENCE_PATTERN.search(compiled)
+    if unavailable:
+        raise SeedanceError(
+            "最终提示词引用了不会提交给 Seedance 的原始媒体："
+            f"{unavailable.group(0)}。请改写为可独立执行的画面或声音描述。"
+        )
     indices = [int(value) for value in re.findall(r"@图片(\d+)", compiled)]
     if indices and max(indices) > image_count:
         raise SeedanceError(
@@ -839,16 +851,20 @@ def compile_prompt(
         )
     prefixes: list[str] = []
     if with_depth:
-        appearance_source = (
-            "人物、产品和场景外观以文字及@图片N为准。"
-            if image_count
-            else "人物、产品和场景外观以文字提示为准。"
-        )
         prefix = (
-            "@视频1是本段细粒度深度白模参考，只提供主体结构、动作、"
-            "空间布局、机位、运镜、切镜和时间节奏；不采用其中近白远黑的"
-            f"深度可视化材质与灰阶颜色。{appearance_source}"
+            "@视频1是本段唯一的镜头结构与运动参考；严格遵循其中的主体动作、"
+            "空间关系、机位、运镜、镜头顺序和时间节奏，不新增镜头或改变动作逻辑；"
+            "不采用其中近白远黑的深度可视化材质与灰阶颜色。"
         )
+        if image_count:
+            prefix += "下方每条图片绑定均与@视频1中相同主体标签一一对应。"
+        else:
+            prefix += "未绑定图片的主体外观严格按下方文字定义。"
+        if with_character_image:
+            prefix += (
+                "白模不负责人物身份、脸型、五官、发型轮廓、头身比、体型细节或"
+                "服装外观；这些信息与白模几何冲突时，以绑定人物图片为准。"
+            )
         prefixes.append(prefix)
     if with_reference_audio:
         prefixes.append(
@@ -987,6 +1003,7 @@ def prepare(args: argparse.Namespace) -> Path:
             len(images),
             bool(depth_files),
             bool(reference_audio),
+            bool(character_image),
         )
         prompt_file = prompts_dir / f"part_{index:02d}.txt"
         prompt_file.write_text(compiled.rstrip() + "\n", encoding="utf-8")

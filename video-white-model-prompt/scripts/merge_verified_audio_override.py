@@ -27,6 +27,7 @@ from verified_video_prompt_reverse import (
     probe_video,
     render_prompt,
     validate_audio_overrides,
+    validate_facts,
 )
 
 
@@ -116,6 +117,13 @@ def main() -> int:
     facts = base_verification.get("verified_source_facts")
     if not isinstance(facts, dict):
         raise SeedanceError("基础 Max 核验结果缺少 verified_source_facts。")
+    analysis_video = validate_identity(base_lock["analysis_video"], "分析视频")
+    metadata = probe_video(analysis_video)
+    facts = validate_facts(
+        facts,
+        int(metadata["duration_seconds"]),
+        int(base_plan["segment_max_seconds"]),
+    )
     bindings = binding_map(base_verification.get("appearance_bindings"))
     overrides = validate_audio_overrides(
         audio_verification.get("audio_overrides"),
@@ -127,8 +135,6 @@ def main() -> int:
 
     definitions = definitions_from_bindings(facts, bindings)
     prompt = render_prompt(facts, definitions, overrides)
-    analysis_video = validate_identity(base_lock["analysis_video"], "分析视频")
-    metadata = probe_video(analysis_video)
     expected_images = len({ref for refs in bindings.values() for ref in refs})
     rebuilt_plan = validate_prompt_contract(
         prompt,
@@ -151,6 +157,7 @@ def main() -> int:
     write_text_output(prompt_output, prompt, False, "音频覆盖合并正式提示词")
     atomic_write_json(plan_output, base_plan)
     merged_verification = copy.deepcopy(base_verification)
+    merged_verification["verified_source_facts"] = facts
     merged_verification["audio_overrides"] = [
         {
             "segment_index": key[0],

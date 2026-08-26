@@ -1078,6 +1078,11 @@ API_CONTROL_LITERAL_PATTERN = re.compile(
 DEFINITION_LINE_PATTERN = re.compile(
     r"^(?:参考@图片\d+中(?:的)?.+，将其定义为<[^<>]+>|将.+定义为<[^<>]+>)[。.]?$"
 )
+MATERIAL_BINDING_LINE_PATTERN = re.compile(
+    r"^@图片\d+(?:、@图片\d+)*是<[^<>]+>的静态外观参考；.+；"
+    r"全文统一称为<[^<>]+>[。.]$"
+)
+OVERVIEW_LINE_PATTERN = re.compile(r"^生成目标：.+[。.]$")
 
 
 def prompt_sections(result: str) -> list[str]:
@@ -1140,15 +1145,28 @@ def validate_no_segment_overview(result: str, label: str) -> None:
             for line in section[: first_shot.start()].splitlines()
             if line.strip()
         ]
-        invalid_lines = [
-            line
-            for line in preamble_lines
-            if DEFINITION_LINE_PATTERN.fullmatch(line) is None
+        overview_positions = [
+            position
+            for position, line in enumerate(preamble_lines)
+            if OVERVIEW_LINE_PATTERN.fullmatch(line)
         ]
+        if len(overview_positions) > 1:
+            raise ScriptError(f"{label}第{index}段包含多条生成目标概述。")
+        invalid_lines = []
+        for position, line in enumerate(preamble_lines):
+            if (
+                DEFINITION_LINE_PATTERN.fullmatch(line)
+                or MATERIAL_BINDING_LINE_PATTERN.fullmatch(line)
+                or OVERVIEW_LINE_PATTERN.fullmatch(line)
+            ):
+                continue
+            invalid_lines.append(line)
+        if overview_positions and overview_positions[0] != len(preamble_lines) - 1:
+            raise ScriptError(f"{label}第{index}段的生成目标必须紧邻镜头1。")
         if invalid_lines:
             raise ScriptError(
                 f"{label}第{index}段在镜头1前包含非主体定义内容；"
-                "主体定义后必须直接进入镜头1。"
+                "只允许主体定义、逐项素材绑定和一条生成目标。"
             )
 
 
