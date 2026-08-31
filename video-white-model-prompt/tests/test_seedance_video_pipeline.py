@@ -196,6 +196,53 @@ class SeedancePipelineTests(unittest.TestCase):
                 body["segments"][0]["depth_video"]["path"], str(depth.resolve())
             )
 
+    def test_prepare_with_openpose_adds_pose_reference_contract(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "@图片1是<角色卡人物>的静态外观参考。\n"
+                "镜头1[00:00-00:10] <角色卡人物>展示产品。\n",
+                encoding="utf-8",
+            )
+            character = root / "character.png"
+            Image.new("RGB", (720, 1280), "blue").save(character)
+            pose_dir = root / "pose"
+            pose_dir.mkdir()
+            pose = pose_dir / "source_depth_720p_part_01.mp4"
+            pose.write_bytes(b"pose")
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.depth_dir = pose_dir
+            args.motion_reference_type = "openpose"
+            args.character_image = character
+            args.character_image_type = "virtual"
+            args.confirm_virtual_portrait_rights = True
+
+            with (
+                mock.patch.object(MODULE, "probe_video", return_value=self.metadata()),
+                mock.patch.object(MODULE, "normalize_depth_video", return_value=pose),
+            ):
+                plan_path = MODULE.prepare(args)
+
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            compiled = Path(body["segments"][0]["prompt"]["path"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(body["mode"], "openpose-reference")
+            self.assertEqual(body["motion_reference_type"], "openpose")
+            self.assertTrue(
+                compiled.startswith("@视频1是本段唯一的人体、面部与手部关键点")
+            )
+            self.assertIn(
+                "不采用其中的黑色背景、彩色骨架线、关键点、连线",
+                compiled,
+            )
+            self.assertIn("人物静态外观全部以绑定人物图片为准", compiled)
+            self.assertNotIn("近白远黑", compiled)
+            self.assertNotIn("白模不负责", compiled)
+
     def test_compile_rejects_reference_to_unavailable_original_media(self) -> None:
         for prompt in (
             "镜头1[00:00-00:10] 原创 BGM 保留原片的节奏。",
@@ -840,6 +887,49 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertNotIn("omni_reference_task_type", request)
             self.assertNotIn(str(source), json.dumps(request, ensure_ascii=False))
             self.assertNotIn("audio_url", json.dumps(request, ensure_ascii=False))
+
+    def test_prepare_can_put_strict_no_text_constraint_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text("镜头1[00:00-00:10] 口播。\n", encoding="utf-8")
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.suppress_text_overlays = True
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            compiled = Path(body["segments"][0]["prompt"]["path"]).read_text(
+                encoding="utf-8"
+            )
+
+            self.assertTrue(body["parameters"]["suppress_text_overlays"])
+            self.assertTrue(compiled.startswith("全片严格输出纯净无字画面"))
+            self.assertIn("画面中不得把任何台词可视化", compiled)
+
+    def test_prepare_visual_only_strips_dialogue_and_requires_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "镜头1[00:00-00:10] 人物正对镜头说话。{这句台词不能进入视觉任务。}\n",
+                encoding="utf-8",
+            )
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.generate_audio = "false"
+            args.suppress_text_overlays = True
+            args.strip_dialogue_for_visual_only = True
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            compiled = Path(body["segments"][0]["prompt"]["path"]).read_text(
+                encoding="utf-8"
+            )
+
+            self.assertFalse(body["parameters"]["generate_audio"])
+            self.assertTrue(body["parameters"]["strip_dialogue_for_visual_only"])
+            self.assertIn("本任务只生成无声视觉画面", compiled)
+            self.assertNotIn("这句台词不能进入视觉任务", compiled)
+            self.assertNotIn("{", compiled)
 
     def test_prepare_and_request_include_authorized_voice_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

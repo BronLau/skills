@@ -89,7 +89,7 @@ CORRECTION_PATH_CONTRACT = {
         "value_shape": "完整 beat 计划数组",
     },
     "beat_actions": {
-        "when": "beat_plan 变化且动作集合同时变化",
+        "when": "shot_plan 不变，但镜头内 beat 动作数组变化；与 beat_plan 是否变化无关",
         "path": "segments[i].shots[j].beat_actions",
         "value_shape": "完整 beat action 数组",
     },
@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--omni-response-body-output", type=Path)
     parser.add_argument("--max-request-body-output", type=Path)
     parser.add_argument("--max-response-body-output", type=Path)
+    parser.add_argument(
+        "--reuse-candidate",
+        action="store_true",
+        help="恢复时优先本地校验已有 Max 候选，通过后不重复调用 Max。",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -444,6 +449,21 @@ def evidence_times(start: float, end: float, source_duration: float) -> tuple[fl
     return tuple(dict.fromkeys(round(value, 3) for value in values))
 
 
+def aggregate_shot_evidence_times(
+    segment_start: float,
+    shot: dict[str, Any],
+    source_duration: float,
+) -> tuple[float, ...]:
+    shot_start = segment_start + float(shot["start_seconds"])
+    shot_end = segment_start + float(shot["end_seconds"])
+    values = set(evidence_times(shot_start, shot_end, source_duration))
+    for beat in shot.get("beats") or []:
+        beat_start = segment_start + float(beat["start_seconds"])
+        beat_end = segment_start + float(beat["end_seconds"])
+        values.update(evidence_times(beat_start, beat_end, source_duration))
+    return tuple(sorted(values))
+
+
 def aggregate_segment_evidence_times(
     segment: dict[str, Any],
     source_duration: float,
@@ -452,13 +472,9 @@ def aggregate_segment_evidence_times(
     segment_end = float(segment["source_end_seconds"])
     values = set(evidence_times(segment_start, segment_end, source_duration))
     for shot in segment["shots"]:
-        shot_start = segment_start + float(shot["start_seconds"])
-        shot_end = segment_start + float(shot["end_seconds"])
-        values.update(evidence_times(shot_start, shot_end, source_duration))
-        for beat in shot.get("beats") or []:
-            beat_start = segment_start + float(beat["start_seconds"])
-            beat_end = segment_start + float(beat["end_seconds"])
-            values.update(evidence_times(beat_start, beat_end, source_duration))
+        values.update(
+            aggregate_shot_evidence_times(segment_start, shot, source_duration)
+        )
     return tuple(sorted(values))
 
 
@@ -478,10 +494,14 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
         result[segment_path + ".shot_plan"] = aggregate_allowed
         result[segment_path + ".shot_visuals"] = aggregate_allowed
         for shot_pos, shot in enumerate(segment["shots"]):
-            start = segment_start + float(shot["start_seconds"])
-            end = segment_start + float(shot["end_seconds"])
             shot_path = f"segments[{segment_pos}].shots[{shot_pos}]"
-            shot_allowed = list(evidence_times(start, end, source_duration))
+            shot_allowed = list(
+                aggregate_shot_evidence_times(
+                    segment_start,
+                    shot,
+                    source_duration,
+                )
+            )
             result[shot_path] = shot_allowed
             result[shot_path + ".beat_plan"] = shot_allowed
             result[shot_path + ".beat_actions"] = shot_allowed
@@ -571,8 +591,11 @@ def visual_differences(
         ):
             if omni_shot["audio"] != verified_shot["audio"]:
                 raise ScriptError("Max 不得修改 Omni 音频事实；音频改写走 audio_overrides。")
-            shot_start = source_offset + float(omni_shot["start_seconds"])
-            shot_end = source_offset + float(omni_shot["end_seconds"])
+            shot_allowed = aggregate_shot_evidence_times(
+                source_offset,
+                omni_shot,
+                source_duration,
+            )
             compare_beats = not (
                 uses_summary_beat(omni_shot) and uses_summary_beat(verified_shot)
             )
@@ -598,8 +621,9 @@ def visual_differences(
                 ] = (
                     omni_beat_plan,
                     verified_beat_plan,
-                    evidence_times(shot_start, shot_end, source_duration),
+                    shot_allowed,
                 )
+            if compare_beats:
                 omni_actions = [beat["action"] for beat in omni_shot["beats"]]
                 verified_actions = [
                     beat["action"] for beat in verified_shot["beats"]
@@ -610,23 +634,7 @@ def visual_differences(
                     ] = (
                         omni_actions,
                         verified_actions,
-                        evidence_times(shot_start, shot_end, source_duration),
-                    )
-            elif compare_beats:
-                for beat_pos, (omni_beat, verified_beat) in enumerate(
-                    zip(omni_shot["beats"], verified_shot["beats"])
-                ):
-                    if omni_beat["action"] == verified_beat["action"]:
-                        continue
-                    beat_start = source_offset + float(omni_beat["start_seconds"])
-                    beat_end = source_offset + float(omni_beat["end_seconds"])
-                    differences[
-                        f"segments[{segment_pos}].shots[{shot_pos}]."
-                        f"beats[{beat_pos}].action"
-                    ] = (
-                        omni_beat["action"],
-                        verified_beat["action"],
-                        evidence_times(beat_start, beat_end, source_duration),
+                        shot_allowed,
                     )
             for field in VISUAL_FIELDS:
                 before = omni_shot[field]
@@ -634,12 +642,10 @@ def visual_differences(
                 if before == after:
                     continue
                 path = f"segments[{segment_pos}].shots[{shot_pos}].{field}"
-                start = source_offset + float(omni_shot["start_seconds"])
-                end = source_offset + float(omni_shot["end_seconds"])
                 differences[path] = (
                     before,
                     after,
-                    evidence_times(start, end, source_duration),
+                    shot_allowed,
                 )
     return differences
 
@@ -876,6 +882,34 @@ def validate_max_result(
         allow_audio_rewrite,
     )
     return verified, definitions, overrides, corrections
+
+
+def validate_max_candidate_text(
+    text: str,
+    label: str,
+    omni: dict[str, Any],
+    duration_seconds: int,
+    segment_max_seconds: int,
+    character_image_present: bool,
+    product_image_count: int,
+    allow_audio_rewrite: bool,
+    source_duration_seconds: float,
+) -> tuple[
+    dict[str, Any],
+    dict[str, list[int]],
+    dict[tuple[int, int], str],
+    list[dict[str, Any]],
+]:
+    return validate_max_result(
+        parse_json_object(text, label),
+        omni,
+        duration_seconds,
+        segment_max_seconds,
+        character_image_present,
+        product_image_count,
+        allow_audio_rewrite,
+        source_duration_seconds,
+    )
 
 
 def timecode(seconds: int) -> str:
@@ -1133,9 +1167,7 @@ def main() -> int:
         except MediaPreflightError as exc:
             raise ScriptError(str(exc)) from exc
         api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
-        if not api_key:
-            if not args.api_key_file:
-                raise ScriptError("未设置 DASHSCOPE_API_KEY 或 --api-key-file。")
+        if not api_key and args.api_key_file:
             api_key = load_api_key(args.api_key_file)
         video = require_readable_file(args.video, "分析视频")
         character = (
@@ -1183,6 +1215,8 @@ def main() -> int:
                 args.segment_max_seconds,
             )
         else:
+            if not api_key:
+                raise ScriptError("未设置 DASHSCOPE_API_KEY 或 --api-key-file。")
             omni_messages = build_omni_messages(
                 omni_system,
                 video_reference,
@@ -1278,119 +1312,158 @@ def main() -> int:
             "Omni 事实初稿",
         )
 
-        character_reference = resolver.resolve(character, "image") if character else None
-        product_references = [resolver.resolve(path, "image") for path in products]
-        max_messages = build_max_messages(
-            args,
-            max_system,
-            video_reference,
-            omni,
-            source_duration,
-            character_reference,
-            product_references,
-        )
-        max_payload = {
-            "model": args.model,
-            "messages": max_messages,
-            "temperature": args.temperature,
-            "max_tokens": min(args.max_tokens, 16384),
-            "enable_thinking": False,
-        }
-        if args.max_request_body_output:
-            write_json_output(
-                args.max_request_body_output,
-                max_payload,
-                args.overwrite,
-                "Max 请求体",
-            )
-        endpoint = f"{args.base_url.rstrip('/')}/chat/completions"
-        raw_max, max_response = call_qwen(
-            endpoint,
-            api_key,
-            max_payload,
-            args.timeout,
-            args.retries,
-        )
-        if args.max_response_body_output:
-            write_json_output(
-                args.max_response_body_output,
-                max_response,
-                args.overwrite,
-                "Max 响应体",
-            )
-        require_complete_finish(completion_finish_reason(max_response), "Max 原片核验")
-        write_text_output(
-            args.candidate_output,
-            raw_max,
-            args.overwrite,
-            "Max 核验候选",
-        )
         expected_images = int(character is not None) + len(products)
-        try:
-            verified, bindings, overrides, corrections = validate_max_result(
-                parse_json_object(raw_max, "Max 核验结果"),
-                omni,
-                duration_seconds,
-                args.segment_max_seconds,
-                character is not None,
-                len(products),
-                bool(args.allow_audio_rewrite),
-                source_duration,
+        max_result: tuple[
+            dict[str, Any],
+            dict[str, list[int]],
+            dict[tuple[int, int], str],
+            list[dict[str, Any]],
+        ] | None = None
+        candidate_path = args.candidate_output.expanduser().resolve()
+        if args.reuse_candidate and candidate_path.is_file():
+            try:
+                raw_candidate = read_text(candidate_path, "已有 Max 核验候选")
+                max_result = validate_max_candidate_text(
+                    raw_candidate,
+                    "已有 Max 核验候选",
+                    omni,
+                    duration_seconds,
+                    args.segment_max_seconds,
+                    character is not None,
+                    len(products),
+                    bool(args.allow_audio_rewrite),
+                    source_duration,
+                )
+            except ScriptError as error:
+                print(
+                    f"MAX_CANDIDATE_REUSE rejected reason={error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print("MAX_CANDIDATE_REUSE accepted", flush=True)
+
+        if max_result is None:
+            if not api_key:
+                raise ScriptError("未设置 DASHSCOPE_API_KEY 或 --api-key-file。")
+            character_reference = (
+                resolver.resolve(character, "image") if character else None
             )
-        except ScriptError as error:
-            repair_payload = {
-                **max_payload,
-                "messages": [
-                    *max_messages,
-                    {"role": "assistant", "content": raw_max},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"机器校验失败：{error}\n重新查看原片，完整输出修复 JSON。"
-                            "corrections 必须遵循用户上下文 correction_path_contract："
-                            "镜头数量、顺序或起止时间变化统一使用 segments[i].shot_plan，"
-                            "相关视觉同步变化使用 segments[i].shot_visuals，"
-                            "shot_visuals 每项只含 correction_path_contract.value_fields，"
-                            "不得额外放入 index、起止时间或 audio；"
-                            "严格执行 timeline_contract，所有镜头与 beat 的起止时间必须是"
-                            " JSON 整数并连续完整覆盖，禁止任何小数秒；"
-                            "不得使用单个 start_seconds 或 end_seconds 路径，也不得申报无实际差异的字段。"
-                            "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
-                            "audio_overrides 非空时，每项必须且只能包含整数"
-                            " segment_index、整数 shot_index 和字符串 audio；audio"
-                            " 必须自包含，不得引用不会提交给 Seedance 的原始媒体。"
-                        ),
-                    },
-                ],
-                "temperature": 0.1,
+            product_references = [resolver.resolve(path, "image") for path in products]
+            max_messages = build_max_messages(
+                args,
+                max_system,
+                video_reference,
+                omni,
+                source_duration,
+                character_reference,
+                product_references,
+            )
+            max_payload = {
+                "model": args.model,
+                "messages": max_messages,
+                "temperature": args.temperature,
+                "max_tokens": min(args.max_tokens, 16384),
+                "enable_thinking": False,
             }
+            if args.max_request_body_output:
+                write_json_output(
+                    args.max_request_body_output,
+                    max_payload,
+                    args.overwrite,
+                    "Max 请求体",
+                )
+            endpoint = f"{args.base_url.rstrip('/')}/chat/completions"
             raw_max, max_response = call_qwen(
                 endpoint,
                 api_key,
-                repair_payload,
+                max_payload,
                 args.timeout,
                 args.retries,
             )
-            require_complete_finish(
-                completion_finish_reason(max_response),
-                "Max 原片核验修复",
-            )
+            if args.max_response_body_output:
+                write_json_output(
+                    args.max_response_body_output,
+                    max_response,
+                    args.overwrite,
+                    "Max 响应体",
+                )
+            require_complete_finish(completion_finish_reason(max_response), "Max 原片核验")
             write_text_output(
                 args.candidate_output,
                 raw_max,
-                True,
-                "Max 核验修复候选",
+                args.overwrite,
+                "Max 核验候选",
             )
-            verified, bindings, overrides, corrections = validate_max_result(
-                parse_json_object(raw_max, "Max 核验修复结果"),
-                omni,
-                duration_seconds,
-                args.segment_max_seconds,
-                character is not None,
-                len(products),
-                bool(args.allow_audio_rewrite),
-                source_duration,
-            )
+            try:
+                max_result = validate_max_candidate_text(
+                    raw_max,
+                    "Max 核验结果",
+                    omni,
+                    duration_seconds,
+                    args.segment_max_seconds,
+                    character is not None,
+                    len(products),
+                    bool(args.allow_audio_rewrite),
+                    source_duration,
+                )
+            except ScriptError as error:
+                repair_payload = {
+                    **max_payload,
+                    "messages": [
+                        *max_messages,
+                        {"role": "assistant", "content": raw_max},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"机器校验失败：{error}\n重新查看原片，完整输出修复 JSON。"
+                                "corrections 必须遵循用户上下文 correction_path_contract："
+                                "镜头数量、顺序或起止时间变化统一使用 segments[i].shot_plan，"
+                                "相关视觉同步变化使用 segments[i].shot_visuals，"
+                                "shot_visuals 每项只含 correction_path_contract.value_fields，"
+                                "不得额外放入 index、起止时间或 audio；"
+                                "严格执行 timeline_contract，所有镜头与 beat 的起止时间必须是"
+                                " JSON 整数并连续完整覆盖，禁止任何小数秒；"
+                                "不得使用单个 start_seconds 或 end_seconds 路径，也不得申报无实际差异的字段。"
+                                "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
+                                "audio_overrides 非空时，每项必须且只能包含整数"
+                                " segment_index、整数 shot_index 和字符串 audio；audio"
+                                " 必须自包含，不得引用不会提交给 Seedance 的原始媒体。"
+                            ),
+                        },
+                    ],
+                    "temperature": 0.1,
+                }
+                raw_max, max_response = call_qwen(
+                    endpoint,
+                    api_key,
+                    repair_payload,
+                    args.timeout,
+                    args.retries,
+                )
+                require_complete_finish(
+                    completion_finish_reason(max_response),
+                    "Max 原片核验修复",
+                )
+                write_text_output(
+                    args.candidate_output,
+                    raw_max,
+                    True,
+                    "Max 核验修复候选",
+                )
+                max_result = validate_max_candidate_text(
+                    raw_max,
+                    "Max 核验修复结果",
+                    omni,
+                    duration_seconds,
+                    args.segment_max_seconds,
+                    character is not None,
+                    len(products),
+                    bool(args.allow_audio_rewrite),
+                    source_duration,
+                )
+
+        verified, bindings, overrides, corrections = max_result
 
         replacements = parse_spoken_replacements(args.spoken_replacement)
         if replacements:

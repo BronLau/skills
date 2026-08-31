@@ -2,7 +2,7 @@
 name: video-white-model-prompt
 description: 当用户明确要求把参考视频生成近白远黑的单目深度白模，或在两阶段反推完整视听提示词后调用 Doubao Seedance 2.0/2.5 生成成片时使用；支持人物图参考，以及经权利人授权的 2–15 秒人声音色参考。支持仅白模、白模+提示词+Seedance成片、无白模+提示词+Seedance成片；不支持只反推提示词，也不要因普通视频分析、静态图片深度或 3D/建筑白模需求而触发。
 metadata:
-  version: 1.14.4
+  version: 1.14.10
 ---
 
 # 视频白模、提示词反推与 Seedance 成片
@@ -71,7 +71,7 @@ Qwen 分析媒体继续使用 Base64 Data URL，逐文件上限为 9.5 MiB；视
 
 Seedance 成片模式要求参考视频至少 4 秒。每段必须是 4 到用户上限之间的整数秒，分段数量固定为 `ceil(总时长 / 用户上限)`：优先使用最少任务数并让各段尽量接近最大时长；尾段不足 4 秒时前移上一切点重新分配，不产生短尾段。
 
-带白模成片时，正式白模仍保持原画幅、CFR、H.264、720p、无音频。若其 FPS、编码、尺寸或宽高比不符合 Seedance 参考视频要求，只在 `seedance/assets/` 生成兼容副本，不修改正式白模。
+带白模成片时，正式白模仍保持原画幅、CFR、H.264、720p、无音频。若其 FPS、编码、尺寸或宽高比不符合 Seedance 参考视频要求，只在 `seedance/assets/` 生成兼容副本，不修改正式白模。用户明确要求用 OpenPose/DWPose 关键点视频替换白模参考时，保持原分段数量与顺序，校验参考视频与对应分段的画幅、帧率、帧数、时长、编码和无音频约束，并在准备计划时设置 `--motion-reference-type openpose`；OpenPose 只负责人体、面部、手部关键点的位置、姿态与时序，不得被描述成深度图，也不得把黑色背景、彩色骨架线、关键点或连线生成到成片。
 
 Seedance 图片在提交前检查总数、大小、像素和宽高比。图片类型素材总数包含人物图和产品图：15 秒分段对应 Seedance 2.0，合计不得超过 9 张；30 秒分段对应 Seedance 2.5，合计不得超过 30 张。人物形象图还必须具有明确的人像类型和 Asset 路由；产品图不进入人像素材库。使用人物 Asset 前确认账号已开通私域素材库能力，Ark 配置中的 AK/SK 具备所需 IAM 权限，且 Asset、Asset Group 与 Ark API Key 都属于固定的 `ProjectName=default`。创建新虚拟 Asset 时，先按人物图 SHA-256 稳定名称调用 `ListAssets` 查找可复用素材；该查询也作为上传前的访问预检。Ark API 拒绝时原样保留错误并停止。
 
@@ -127,6 +127,8 @@ python3 <skill-root>/scripts/run_pipeline.py \
   --seedance-ratio <source|adaptive|固定画幅> \
   --seedance-output-format <mp4|mov> \
   --seedance-generate-audio <auto|true|false> \
+  --seedance-suppress-text-overlays \
+  --seedance-strip-dialogue-for-visual-only \
   --output-dir <新目录>
 ```
 
@@ -134,7 +136,7 @@ python3 <skill-root>/scripts/run_pipeline.py \
 
 Omni 结构化事实必须使用最少分段数，以整数秒连续覆盖完整目标时长；段内镜头编号和时间轴连续。每个镜头的 `beats` 使用段内相对整数时间，连续覆盖该镜头；动作、表情、操作人员或产品动作发生阶段变化时拆分 beat，但不得虚构切镜。存在人声时逐字写入 `{}`，没有可辨识人声时设置 `no_speech_confirmed=true`。人物图、产品图、名称、卖点和创意不发送给 Omni，避免替换素材污染原片动作理解。Omni JSON 不通过时携带具体错误定向修复一次，仍失败则停止。
 
-Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序、边界、时长和音频总内容；可以依据原片纠正主体清单、段内镜头与 beat 的数量、顺序、连续整数时间区间及视觉字段，但每类变化都必须在 `fact_review.corrections` 中逐项写明字段路径、完整 Omni 原值、完整修正值、证据时间和证据说明。correction 路径与校验粒度保持一致：主体清单变化使用 `subjects`；镜头数量、顺序或起止时间变化使用 `segments[i].shot_plan`，并以完整镜头计划数组作为原值和修正值，不得拆成单个 `start_seconds` 或 `end_seconds` 路径；镜头结构变化同时带来视觉内容变化时另用 `segments[i].shot_visuals`，其数组项只包含允许的视觉字段和 `beats`，不重复包含 `index`、起止时间或 `audio`；镜头结构不变时才使用逐镜头视觉字段路径，beat 计划或动作集合变化分别使用 `beat_plan` 或 `beat_actions`。聚合镜头修正可以从程序为该段汇总的段、镜头和 beat 起点、中点、终点中选取证据；每项证据时间至少包含两个不同的有限数，并且必须来自对应 correction 路径的 `allowed_evidence_times`。任何未解释的事实变化、越权字段、NaN/Infinity 或无对应时间证据的修改都会被机器拒绝。
+Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序、边界、时长和音频总内容；可以依据原片纠正主体清单、段内镜头与 beat 的数量、顺序、连续整数时间区间及视觉字段，但每类变化都必须在 `fact_review.corrections` 中逐项写明字段路径、完整 Omni 原值、完整修正值、证据时间和证据说明。correction 路径与校验粒度保持一致：主体清单变化使用 `subjects`；镜头数量、顺序或起止时间变化使用 `segments[i].shot_plan`，并以完整镜头计划数组作为原值和修正值，不得拆成单个 `start_seconds` 或 `end_seconds` 路径；镜头结构变化同时带来视觉内容变化时另用 `segments[i].shot_visuals`，其数组项只包含允许的视觉字段和 `beats`，不重复包含 `index`、起止时间或 `audio`；镜头结构不变时才使用逐镜头视觉字段路径，beat 时间计划变化使用 `beat_plan`，beat 动作数组变化独立使用 `beat_actions`，两者同时变化时分别记录。聚合镜头修正可以从程序为该段汇总的段、镜头和 beat 起点、中点、终点中选取证据；每项证据时间至少包含两个不同的有限数，并且必须来自对应 correction 路径的 `allowed_evidence_times`。任何未解释的事实变化、越权字段、NaN/Infinity 或无对应时间证据的修改都会被机器拒绝。
 
 人物图和产品图只进入结构化 `appearance_bindings`，每项只能包含主体标签和图片编号数组，不允许 Max 输出自由文本主体定义。人物图只能绑定 `kind=character`，产品图只能绑定 `kind=product`，每张图片只能绑定一个主体；程序为每张图片生成逐项素材绑定，明确对应主体、只参考的静态外观维度以及不参考的姿态、动作、景别、机位或拼版布局。因此替换素材不能通过定义文本夹带动作、姿态变化、景别、运镜、身体可见范围或进出场。用户在事实锁之后明确要求多个原片人物统一为同一人物形象时，不让 Max 重写动作事实，而是使用受限静态覆盖把这些人物标签合并为一个中性目标标签，再把人物图绑定到该目标标签；原标签中的发型、服装等外观词不得继续进入正式 Prompt。
 
@@ -142,7 +144,7 @@ Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序
 
 已锁定计划因音频策略失败，而用户只授权修改音频时，保留原失败计划和任务状态；Max 新结果只提供通过契约校验的 `audio_overrides`。使用 `scripts/merge_verified_audio_override.py` 把这些音频覆盖确定性合并到上一版已锁定的视觉事实与外观绑定中，拒绝新 Max 结果带来的任何视觉字段、主体、分段或时间轴漂移，并为新计划生成独立事实锁。
 
-程序确定性组装的正式 Prompt 必须使用实际存在的 `@图片N`，不保留泛化占位符；不输出 4K、画幅、分辨率等 API 参数，也不写视频编辑或延长意图。每段先输出逐项素材与主体绑定；人物图若包含同一人物的多视图或拼版，必须声明这些视图共同定义同一主体且不生成多个副本。随后输出一条只汇总锁定事实的 `生成目标`，再进入 `镜头1[...]`。每个镜头先写景别、机位、构图、场景等镜头级信息，再按连续整数时间写 `动作阶段N[...]`，最后单独写声音；末尾使用明确的全片一致性和字幕、水印、品牌文字约束。每段镜头1对应原片分段起点，段内镜头和 beat 沿用 Max 根据原片核验后的顺序与时间。`seedance_video_pipeline.py prepare` 会拆出每段独立 Prompt；带白模模式以 `@视频1` 的唯一镜头结构与运动职责开头，并说明逐项绑定的图片主体对应白模中的同名主体。存在人物图时，白模只锁定动作骨架、姿态变化、遮挡、空间、机位、运镜和时序，不负责人物身份、脸型、五官、发型轮廓、头身比、体型细节或服装外观；这些信息冲突时以绑定人物图为准。无白模模式不增加任何视频引用。
+程序确定性组装的正式 Prompt 必须使用实际存在的 `@图片N`，不保留泛化占位符；不输出 4K、画幅、分辨率等 API 参数，也不写视频编辑或延长意图。每段先输出逐项素材与主体绑定；人物图若包含同一人物的多视图或拼版，必须声明这些视图共同定义同一主体且不生成多个副本。随后输出一条只汇总锁定事实的 `生成目标`，再进入 `镜头1[...]`。每个镜头先写景别、机位、构图、场景等镜头级信息，再按连续整数时间写 `动作阶段N[...]`，最后单独写声音；末尾使用明确的全片一致性和字幕、水印、品牌文字约束。每段镜头1对应原片分段起点，段内镜头和 beat 沿用 Max 根据原片核验后的顺序与时间。`seedance_video_pipeline.py prepare` 会拆出每段独立 Prompt；带白模模式以 `@视频1` 的唯一镜头结构与运动职责开头，并说明逐项绑定的图片主体对应白模中的同名主体。存在人物图时，白模只锁定动作骨架、姿态变化、遮挡、空间、机位、运镜和时序，不负责人物身份、脸型、五官、发型轮廓、头身比、体型细节或服装外观；这些信息冲突时以绑定人物图为准。OpenPose 模式则以 `@视频1` 的人体、面部、手部关键点位置、姿态、构图与时序职责开头，明确不采用黑底、骨架线、关键点或连线，且人物身份与全部静态外观只由绑定人物图或静态定义决定。无白模模式不增加任何视频引用。
 
 第一阶段成功后写入 `omni_facts.json`、`max_verification.json`、`fact_lock.json`、`ready_for_seedance.json` 和 `seedance/seedance_plan.json`，但不调用 Seedance。`fact_lock.json` 绑定分析视频、Omni 事实、Max 核验结果、正式 Prompt、分段计划、运行时 Prompt、模型与 FPS；任一产物变化时拒绝准备或提交 Seedance。
 
@@ -164,6 +166,12 @@ Max 不直接输出最终 Prompt。它必须保持 Omni 的段级数量、顺序
 
 用户在尚未上传或创建任务时明确要求修改人物静态服饰、场景或构图的，不能直接手改已锁定 Prompt。把用户确认后的覆盖项写入独立 JSON，并使用 `scripts/apply_static_visual_overrides.py` 重建 Prompt 和事实锁；覆盖范围只允许主体静态定义、受限 `subject_aliases` 以及逐镜头 `composition`、`scene_light`，不得改变动作、景别、机位、运镜、进出场、时间轴或音频。`subject_aliases` 只用于把用户指定的多个人物标签合并成一个中性人物标签；合并目标必须提供显式静态定义，程序同步替换视觉事实中的标签并合并图片绑定，不修改音频。已有上传记录或任务 ID 时不得覆盖原计划，必须在独立输出目录创建新计划。随后按原参数重新运行 `seedance_video_pipeline.py prepare --overwrite`，校验新计划并再次展示第二次确认。
 
+已完成成片出现字幕、台词文字或乱码，而用户要求无字幕版本时，不重跑 Qwen、不覆盖原计划。复用原 Prompt、事实锁、分段计划、白模、图片、音色参考和 Seed，在独立输出目录重新运行 `seedance_video_pipeline.py prepare`，追加 `--suppress-text-overlays`。该参数把“全片纯净无字、口播只以声音呈现”的硬约束放在每段运行时 Prompt 首部，并写入 Seedance 计划参数；重新展示第二次确认后才创建新任务。
+
+若使用 `--suppress-text-overlays` 重新生成后，逐段抽帧仍发现烧录字幕，不继续重复创建 Seedance 任务。使用 `scripts/remove_burned_subtitles.py` 在本地逐帧识别下半画面中带深色描边的白色字幕并局部修复，重新编码 H.264 视频，同时直接复用原 AAC 音轨；输出到新文件，不覆盖 Seedance 原始成片。必须抽取覆盖全片的采样帧做视觉 QA，确认字幕确实移除且人物与场景没有明显修复破坏后再交付。
+
+若逐帧擦除样例在人物或产品上留下明显修复伪影，停止批量擦除。改用独立的无声视觉计划：准备计划时不传音色参考，设置 `--generate-audio false`、`--suppress-text-overlays` 和 `--strip-dialogue-for-visual-only`。程序从运行时 Prompt 中确定性移除大括号台词与独立声音行，只保留人物说话动作，并在首部声明音轨将在本地后期封装。无声视觉成片通过抽帧无字幕 QA 后，使用 FFmpeg 直接复用上一版统一音色 AAC 音轨，不重编码音频；最终文件还需重新校验时长和音轨。
+
 ```bash
 python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --prompt <输出目录>/prompt.txt \
@@ -171,6 +179,7 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --fact-lock <输出目录>/fact_lock.json \
   --source-video <原片> \
   --depth-dir <带白模时传入> \
+  --motion-reference-type <depth|openpose> \
   --character-image <按原计划可选> \
   --character-image-type <virtual|real> \
   --character-asset-id <按原计划可选> \
@@ -183,6 +192,8 @@ python3 <skill-root>/scripts/seedance_video_pipeline.py prepare \
   --ratio <修改后值> \
   --output-format <修改后值> \
   --generate-audio <修改后值> \
+  --suppress-text-overlays \
+  --strip-dialogue-for-visual-only \
   --seed <原Seed或用户新值> \
   --overwrite
 ```
@@ -211,7 +222,7 @@ Ark 配置文件同时承载 Seedance 的 `ARK_API_KEY`（兼容 `Volcengine_API
 
 ## 恢复与失败
 
-第一阶段恢复时复用原命令、原输入、原输出目录并增加 `--resume`。输入清单不一致时拒绝恢复；可复用已验证的 `omni_facts.json`、Omni 元数据和完整深度缓存，重新执行 Max 原片核验与确定性组装。
+第一阶段恢复时复用原命令、原输入、原输出目录并增加 `--resume`。输入清单不一致时拒绝恢复；可复用已验证的 `omni_facts.json`、Omni 元数据和完整深度缓存。存在上次 Max 候选时先按当前契约在本地重新校验，通过后直接确定性组装，不重复调用 Max；仍不通过时才重新执行 Max 原片核验。深度推理成功后独立编码白模，Qwen 或 Max 失败不得阻止白模产物落盘；后续提示词计划成功时再按正式分段计划校准编码。
 
 Seedance 使用 `seedance/tasks.json` 持久化上传对象、任务 ID 和状态：
 

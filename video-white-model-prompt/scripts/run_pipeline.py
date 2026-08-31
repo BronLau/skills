@@ -112,6 +112,10 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--seedance-watermark", action="store_true")
+    parser.add_argument("--seedance-suppress-text-overlays", action="store_true")
+    parser.add_argument(
+        "--seedance-strip-dialogue-for-visual-only", action="store_true"
+    )
     parser.add_argument("--seedance-seed", type=int)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -256,6 +260,12 @@ def run_manifest(
             "output_format": args.seedance_output_format,
             "generate_audio": args.seedance_generate_audio,
             "watermark": bool(args.seedance_watermark),
+            "suppress_text_overlays": bool(
+                getattr(args, "seedance_suppress_text_overlays", False)
+            ),
+            "strip_dialogue_for_visual_only": bool(
+                getattr(args, "seedance_strip_dialogue_for_visual_only", False)
+            ),
             "seed": args.seedance_seed,
         }
         if args.scope != "depth-only"
@@ -496,6 +506,10 @@ def build_seedance_prepare_command(
             command.append("--confirm-voice-rights")
     if args.seedance_watermark:
         command.append("--watermark")
+    if bool(getattr(args, "seedance_suppress_text_overlays", False)):
+        command.append("--suppress-text-overlays")
+    if bool(getattr(args, "seedance_strip_dialogue_for_visual_only", False)):
+        command.append("--strip-dialogue-for-visual-only")
     if args.seedance_seed is not None:
         command.extend(["--seed", str(args.seedance_seed)])
     if args.resume:
@@ -765,6 +779,8 @@ def main() -> int:
                 )
             if args.resume:
                 qwen_command.append("--overwrite")
+                if candidate_path.is_file():
+                    qwen_command.append("--reuse-candidate")
             if key_path:
                 qwen_command.extend(["--api-key-file", str(key_path)])
             if args.product_name.strip():
@@ -850,26 +866,47 @@ def main() -> int:
             )
 
         encode_code: int | None = 0 if not with_depth else None
-        if with_depth and depth_code == 0 and qwen_code == 0 and plan_path.is_file():
+        if with_depth and depth_code == 0:
             depth_dir = output_dir / "depth"
             existing_outputs = depth_outputs(depth_dir, video)
-            if existing_outputs:
-                archive_depth_outputs(output_dir, video)
-            depth_encode = [
-                sys.executable,
-                str(DEPTH_SCRIPT),
-                "--mode",
-                "encode",
-                "--input",
-                str(video),
-                "--work-dir",
-                str(work_dir),
-                "--output-dir",
-                str(output_dir / "depth"),
-                "--segment-plan",
-                str(plan_path),
-            ]
-            encode_code = run_process(depth_encode)
+            if qwen_code == 0 and plan_path.is_file():
+                if existing_outputs:
+                    archive_depth_outputs(output_dir, video)
+                depth_encode = [
+                    sys.executable,
+                    str(DEPTH_SCRIPT),
+                    "--mode",
+                    "encode",
+                    "--input",
+                    str(video),
+                    "--work-dir",
+                    str(work_dir),
+                    "--output-dir",
+                    str(depth_dir),
+                    "--segment-plan",
+                    str(plan_path),
+                ]
+                encode_code = run_process(depth_encode)
+            elif existing_outputs:
+                encode_code = 0
+                print("DEPTH_ENCODE reused_provisional", flush=True)
+            else:
+                depth_encode = [
+                    sys.executable,
+                    str(DEPTH_SCRIPT),
+                    "--mode",
+                    "encode",
+                    "--input",
+                    str(video),
+                    "--work-dir",
+                    str(work_dir),
+                    "--output-dir",
+                    str(depth_dir),
+                    "--segment-seconds",
+                    str(args.segment_max_seconds),
+                ]
+                print("DEPTH_ENCODE provisional", flush=True)
+                encode_code = run_process(depth_encode)
 
         if qwen_code == 0 and depth_code == 0 and encode_code == 0:
             seedance_prepare = build_seedance_prepare_command(

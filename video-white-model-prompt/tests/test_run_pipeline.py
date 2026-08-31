@@ -414,7 +414,9 @@ class ResumePipelineTests(unittest.TestCase):
 
             self.assertTrue((args.output_dir / "prompt_draft.txt").is_file())
             self.assertTrue((args.output_dir / ".depth_work").is_dir())
-            self.assertFalse(list((args.output_dir / "depth").glob("*.mp4")))
+            self.assertTrue(
+                (args.output_dir / "depth/input_depth_720p_part_01.mp4").is_file()
+            )
 
             args.resume = True
             resume_commands: list[list[str]] = []
@@ -494,7 +496,7 @@ class ResumePipelineTests(unittest.TestCase):
             ):
                 self.assertEqual(MODULE.main(), 0)
 
-    def test_qwen_failure_reports_depth_encode_as_skipped(self) -> None:
+    def test_qwen_failure_still_encodes_provisional_depth_video(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             video = root / "input.mp4"
@@ -506,23 +508,33 @@ class ResumePipelineTests(unittest.TestCase):
             def fake_popen(command: list[str]):
                 return FakeProcess(1 if str(MODULE.QWEN_SCRIPT) in command else 0)
 
+            encode_commands: list[list[str]] = []
+
+            def fake_run_process(command: list[str]) -> int:
+                encode_commands.append(command)
+                output_dir = self.command_value(command, "--output-dir")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "input_depth_720p_part_01.mp4").write_bytes(b"depth")
+                return 0
+
             stderr = StringIO()
             with (
                 mock.patch.object(MODULE, "parse_args", return_value=args),
                 mock.patch.object(MODULE, "resolve_depth_model", return_value=model),
                 mock.patch.object(MODULE, "validate_analysis_video"),
                 mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
-                mock.patch.object(
-                    MODULE,
-                    "run_process",
-                    side_effect=AssertionError("Qwen 失败后不应运行深度编码"),
-                ),
+                mock.patch.object(MODULE, "run_process", side_effect=fake_run_process),
                 mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "sk-test-value"}),
                 redirect_stderr(stderr),
             ):
                 self.assertEqual(MODULE.main(), 1)
 
-            self.assertIn("depth_encode=skipped", stderr.getvalue())
+            self.assertEqual(len(encode_commands), 1)
+            self.assertIn("--segment-seconds", encode_commands[0])
+            self.assertIn("depth_encode=0", stderr.getvalue())
+            self.assertTrue(
+                (args.output_dir / "depth/input_depth_720p_part_01.mp4").is_file()
+            )
 
     def test_prompt_seedance_mode_never_resolves_or_runs_depth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

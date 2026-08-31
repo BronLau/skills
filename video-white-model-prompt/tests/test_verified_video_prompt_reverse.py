@@ -99,6 +99,7 @@ class VerifiedPromptTests(unittest.TestCase):
             omni_response_body_output=None,
             max_request_body_output=None,
             max_response_body_output=None,
+            reuse_candidate=False,
             overwrite=False,
             temperature=0.3,
             max_tokens=32768,
@@ -232,6 +233,70 @@ class VerifiedPromptTests(unittest.TestCase):
         broken["segments"][0]["shots"][0]["beats"][1]["start_seconds"] = 5
         with self.assertRaisesRegex(MODULE.ScriptError, "beat 无效或不连续"):
             MODULE.validate_facts(broken, 10, 15)
+
+    def test_beat_action_changes_use_one_aggregate_path(self) -> None:
+        omni_body = self.facts(camera="固定机位")
+        omni_body["segments"][0]["shots"][0]["beats"] = [
+            {
+                "index": 1,
+                "start_seconds": 0,
+                "end_seconds": 4,
+                "action": "刷涂人物右眼睫毛",
+            },
+            {
+                "index": 2,
+                "start_seconds": 4,
+                "end_seconds": 10,
+                "action": "刷头离开画面",
+            },
+        ]
+        verified_body = deepcopy(omni_body)
+        verified_body["segments"][0]["shots"][0]["beats"][0]["action"] = (
+            "刷涂人物左眼睫毛"
+        )
+
+        omni = MODULE.validate_facts(omni_body, 10, 15)
+        verified = MODULE.validate_facts(verified_body, 10, 15)
+        differences = MODULE.visual_differences(omni, verified, 10.0)
+
+        self.assertEqual(
+            set(differences),
+            {"segments[0].shots[0].beat_actions"},
+        )
+
+    def test_beat_plan_and_actions_are_independent_corrections(self) -> None:
+        omni_body = self.facts(camera="固定机位")
+        omni_body["segments"][0]["shots"][0]["beats"] = [
+            {
+                "index": 1,
+                "start_seconds": 0,
+                "end_seconds": 4,
+                "action": "刷涂人物右眼睫毛",
+            },
+            {
+                "index": 2,
+                "start_seconds": 4,
+                "end_seconds": 10,
+                "action": "刷头离开画面",
+            },
+        ]
+        verified_body = deepcopy(omni_body)
+        verified_beats = verified_body["segments"][0]["shots"][0]["beats"]
+        verified_beats[0]["end_seconds"] = 5
+        verified_beats[0]["action"] = "刷涂人物左眼睫毛"
+        verified_beats[1]["start_seconds"] = 5
+
+        omni = MODULE.validate_facts(omni_body, 10, 15)
+        verified = MODULE.validate_facts(verified_body, 10, 15)
+        differences = MODULE.visual_differences(omni, verified, 10.0)
+
+        self.assertEqual(
+            set(differences),
+            {
+                "segments[0].shots[0].beat_plan",
+                "segments[0].shots[0].beat_actions",
+            },
+        )
 
     def test_image_binding_is_explicit_and_limits_reference_scope(self) -> None:
         facts = MODULE.validate_facts(self.facts(), 10, 15)
@@ -422,6 +487,31 @@ class VerifiedPromptTests(unittest.TestCase):
         self.assertIn(7.0, allowed)
         self.assertIn(8.5, allowed)
 
+    def test_shot_field_evidence_includes_internal_beat_sample_points(self) -> None:
+        body = self.facts(camera="固定机位")
+        body["segments"][0]["shots"][0]["beats"] = [
+            {
+                "index": 1,
+                "start_seconds": 0,
+                "end_seconds": 4,
+                "action": "刷涂睫毛",
+            },
+            {
+                "index": 2,
+                "start_seconds": 4,
+                "end_seconds": 10,
+                "action": "展示刷后效果",
+            },
+        ]
+        facts = MODULE.validate_facts(body, 10, 15)
+        index = MODULE.evidence_time_index(facts, 10.0)
+
+        for path in (
+            "segments[0].shots[0]",
+            "segments[0].shots[0].beat_actions",
+        ):
+            self.assertEqual(index[path], [0.0, 2.0, 4.0, 5.0, 7.0, 10.0])
+
     def test_main_uses_two_calls_and_renders_max_verified_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -509,6 +599,90 @@ class VerifiedPromptTests(unittest.TestCase):
             self.assertIn("仅轻微眨眼", prompt)
             self.assertNotIn("平稳横移", prompt)
             self.assertNotIn("抬手摸脸", prompt)
+
+    def test_main_reuses_valid_saved_max_candidate_without_api_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.make_args(root)
+            args.reuse_candidate = True
+            args.overwrite = True
+            omni = MODULE.validate_facts(self.facts(), 10, 15)
+            verified = MODULE.validate_facts(
+                self.facts(camera="固定机位", action="人物正对镜头，仅轻微眨眼"),
+                10,
+                15,
+            )
+            differences = MODULE.visual_differences(omni, verified, 10.0)
+            max_result = {
+                "fact_review": {
+                    "status": "corrected",
+                    "corrections": [
+                        {
+                            "path": path,
+                            "omni_value": before,
+                            "corrected_value": after,
+                            "evidence_times": [interval[0], interval[1]],
+                            "evidence_description": "原片对应时间点可见",
+                        }
+                        for path, (before, after, interval) in differences.items()
+                    ],
+                },
+                "verified_source_facts": verified,
+                "appearance_bindings": [{"label": "<模特>", "image_refs": [1]}],
+                "audio_overrides": [],
+            }
+            args.omni_facts_output.write_text(
+                json.dumps(omni, ensure_ascii=False), encoding="utf-8"
+            )
+            args.omni_facts_file = args.omni_facts_output
+            args.omni_metadata_file = args.omni_metadata_output
+            args.omni_metadata_output.write_text(
+                json.dumps(MODULE.input_metadata(args, args.video, None, 10)),
+                encoding="utf-8",
+            )
+            args.candidate_output.write_text(
+                json.dumps(max_result, ensure_ascii=False), encoding="utf-8"
+            )
+
+            class FakeResolver:
+                def __init__(self, _: object) -> None:
+                    pass
+
+                def resolve(self, path: Path, kind: str) -> str:
+                    return f"data:{kind}/{path.name}"
+
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=args),
+                mock.patch.object(
+                    MODULE,
+                    "probe_video",
+                    return_value={
+                        "duration_seconds": 10,
+                        "source_duration": 10.0,
+                        "has_audio": False,
+                    },
+                ),
+                mock.patch.object(MODULE, "validate_video_api_limits"),
+                mock.patch.object(MODULE, "validate_image_api_limits"),
+                mock.patch.object(MODULE, "MediaResolver", FakeResolver),
+                mock.patch.object(
+                    MODULE,
+                    "call_omni",
+                    side_effect=AssertionError("已有 Omni 事实时不应调用 Omni"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "call_qwen",
+                    side_effect=AssertionError("有效候选不应重复调用 Max"),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                code = MODULE.main()
+
+            self.assertEqual(code, 0)
+            self.assertTrue(args.verification_output.is_file())
+            self.assertTrue(args.fact_lock_output.is_file())
+            self.assertIn("固定机位", args.output.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -126,6 +126,11 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--fact-lock", type=Path, required=True)
     prepare.add_argument("--source-video", type=Path, required=True)
     prepare.add_argument("--depth-dir", type=Path)
+    prepare.add_argument(
+        "--motion-reference-type",
+        choices=("depth", "openpose"),
+        default="depth",
+    )
     prepare.add_argument("--character-image", type=Path)
     prepare.add_argument(
         "--character-image-type",
@@ -153,6 +158,8 @@ def parse_args() -> argparse.Namespace:
         "--generate-audio", choices=("auto", "true", "false"), default="auto"
     )
     prepare.add_argument("--watermark", action="store_true")
+    prepare.add_argument("--suppress-text-overlays", action="store_true")
+    prepare.add_argument("--strip-dialogue-for-visual-only", action="store_true")
     prepare.add_argument("--seed", type=int)
     prepare.add_argument("--overwrite", action="store_true")
 
@@ -848,10 +855,17 @@ def compile_prompt(
     with_depth: bool,
     with_reference_audio: bool = False,
     with_character_image: bool = False,
+    motion_reference_type: str = "depth",
+    suppress_text_overlays: bool = False,
+    strip_dialogue_for_visual_only: bool = False,
 ) -> str:
     if re.search(r"@(?:视频|音频)\d+", body):
         raise SeedanceError("Max 正式稿不得预先包含 @视频N 或 @音频N 引用。")
     compiled = re.sub(r"(?<!@)图片(?P<number>\d+)", r"@图片\g<number>", body)
+    if strip_dialogue_for_visual_only:
+        compiled = re.sub(r"\{[^{}]*\}", "", compiled)
+        compiled = re.sub(r"(?m)^\s*声音[:：].*$", "", compiled)
+        compiled = re.sub(r"。\s*。", "。", compiled)
     compiled = compiled.replace("4K高清", "高清").replace("4K 高清", "高清")
     if re.search(r"@(?:图片|视频|音频)N", compiled):
         raise SeedanceError("最终提示词包含未实例化的素材占位符。")
@@ -872,20 +886,48 @@ def compile_prompt(
             f"提示词引用了不存在的 @图片{max(indices)}，实际只有 {image_count} 张。"
         )
     prefixes: list[str] = []
-    if with_depth:
-        prefix = (
-            "@视频1是本段唯一的镜头结构与运动参考；严格遵循其中的主体动作、"
-            "空间关系、机位、运镜、镜头顺序和时间节奏，不新增镜头或改变动作逻辑；"
-            "不采用其中近白远黑的深度可视化材质与灰阶颜色。"
+    if strip_dialogue_for_visual_only:
+        prefixes.append(
+            "本任务只生成无声视觉画面，不生成、理解或展示任何台词文本；"
+            "人物按动作描述自然做出口播时的嘴部与表情变化，但画面中不得出现"
+            "字幕、文字或语音可视化。最终音轨将在本地后期单独封装。"
         )
+    if suppress_text_overlays:
+        prefixes.append(
+            "全片严格输出纯净无字画面：禁止生成任何字幕、台词文字、标题、"
+            "贴纸、弹幕、角标、UI、标牌、品牌字样、Logo、水印、乱码或其他"
+            "可读文字；所有口播只以声音呈现，画面中不得把任何台词可视化。"
+        )
+    if with_depth:
+        if motion_reference_type == "openpose":
+            prefix = (
+                "@视频1是本段唯一的人体、面部与手部关键点位置、姿态、构图和"
+                "动作时序参考；严格遵循关键点表达的主体位置、姿态变化、动作阶段、"
+                "镜头顺序和时间节奏，不新增人物或改变动作逻辑；不采用其中的黑色"
+                "背景、彩色骨架线、关键点、连线或任何姿态可视化标记。"
+            )
+        elif motion_reference_type == "depth":
+            prefix = (
+                "@视频1是本段唯一的镜头结构与运动参考；严格遵循其中的主体动作、"
+                "空间关系、机位、运镜、镜头顺序和时间节奏，不新增镜头或改变动作逻辑；"
+                "不采用其中近白远黑的深度可视化材质与灰阶颜色。"
+            )
+        else:
+            raise SeedanceError(f"不支持的动作参考类型：{motion_reference_type}")
         if image_count:
             prefix += "下方每条图片绑定均与@视频1中相同主体标签一一对应。"
         else:
             prefix += "未绑定图片的主体外观严格按下方文字定义。"
-        if with_character_image:
+        if with_character_image and motion_reference_type == "depth":
             prefix += (
                 "白模不负责人物身份、脸型、五官、发型轮廓、头身比、体型细节或"
                 "服装外观；这些信息与白模几何冲突时，以绑定人物图片为准。"
+            )
+        elif with_character_image and motion_reference_type == "openpose":
+            prefix += (
+                "OpenPose 只负责人形关键点的空间位置、姿态与时序，不负责人物身份、"
+                "脸型、五官、发型轮廓、头身比、体型细节、服装或材质；人物静态外观"
+                "全部以绑定人物图片为准。"
             )
         prefixes.append(prefix)
     if with_reference_audio:
@@ -973,6 +1015,11 @@ def prepare(args: argparse.Namespace) -> Path:
         directory.mkdir(exist_ok=True)
 
     prompt_bodies = split_prompt(prompt_path.read_text(encoding="utf-8"), segments)
+    motion_reference_type = str(
+        getattr(args, "motion_reference_type", "depth") or "depth"
+    )
+    if motion_reference_type not in {"depth", "openpose"}:
+        raise SeedanceError(f"不支持的动作参考类型：{motion_reference_type}")
     depth_files: list[Path] = []
     if args.depth_dir:
         depth_dir = args.depth_dir.expanduser().resolve()
@@ -983,6 +1030,8 @@ def prepare(args: argparse.Namespace) -> Path:
             raise SeedanceError(
                 f"白模分段数量与提示词不一致：{len(depth_files)} != {len(segments)}"
             )
+    elif motion_reference_type != "depth":
+        raise SeedanceError("指定 OpenPose 动作参考类型时必须提供参考视频目录。")
 
     source_metadata = probe_video(source_video)
     if float(source_metadata["duration"]) < MIN_GENERATION_SECONDS:
@@ -994,6 +1043,13 @@ def prepare(args: argparse.Namespace) -> Path:
         generate_audio = args.generate_audio == "true"
     if reference_audio and not generate_audio:
         raise SeedanceError("使用音色参考时必须启用 generate_audio。")
+    strip_dialogue_for_visual_only = bool(
+        getattr(args, "strip_dialogue_for_visual_only", False)
+    )
+    if strip_dialogue_for_visual_only and generate_audio:
+        raise SeedanceError("无声视觉模式必须设置 generate_audio=false。")
+    if strip_dialogue_for_visual_only and reference_audio:
+        raise SeedanceError("无声视觉模式不得提交音色参考。")
     seed = args.seed if args.seed is not None else secrets.randbelow(MAX_SEED + 1)
     if not -1 <= seed <= MAX_SEED:
         raise SeedanceError(f"--seed 必须在 -1 到 {MAX_SEED} 之间。")
@@ -1026,6 +1082,9 @@ def prepare(args: argparse.Namespace) -> Path:
             bool(depth_files),
             bool(reference_audio),
             bool(character_image),
+            motion_reference_type,
+            bool(getattr(args, "suppress_text_overlays", False)),
+            strip_dialogue_for_visual_only,
         )
         prompt_file = prompts_dir / f"part_{index:02d}.txt"
         prompt_file.write_text(compiled.rstrip() + "\n", encoding="utf-8")
@@ -1047,7 +1106,14 @@ def prepare(args: argparse.Namespace) -> Path:
         "run_id": uuid.uuid4().hex,
         "model": model_id,
         "segment_max_seconds": segment_max_seconds,
-        "mode": "depth-reference" if depth_files else "text-and-image-reference",
+        "mode": (
+            "openpose-reference"
+            if depth_files and motion_reference_type == "openpose"
+            else "depth-reference"
+            if depth_files
+            else "text-and-image-reference"
+        ),
+        "motion_reference_type": motion_reference_type if depth_files else None,
         "source_video": file_identity(source_video),
         "prompt": file_identity(prompt_path),
         "fact_lock": file_identity(lock_path),
@@ -1085,6 +1151,10 @@ def prepare(args: argparse.Namespace) -> Path:
             "ratio": ratio,
             "output_format": args.output_format,
             "watermark": bool(args.watermark),
+            "suppress_text_overlays": bool(
+                getattr(args, "suppress_text_overlays", False)
+            ),
+            "strip_dialogue_for_visual_only": strip_dialogue_for_visual_only,
             "generate_audio": generate_audio,
             "seed": seed,
         },
