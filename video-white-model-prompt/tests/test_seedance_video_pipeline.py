@@ -1351,6 +1351,7 @@ class SeedancePipelineTests(unittest.TestCase):
                     "concat_generated_videos",
                     side_effect=fake_concat,
                 ),
+                mock.patch("builtins.print") as print_mock,
             ):
                 MODULE.submit(submit_args, client_factory=lambda _: client)
                 legacy_plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1365,6 +1366,30 @@ class SeedancePipelineTests(unittest.TestCase):
             )
             self.assertEqual(state["segments"]["1"]["status"], "downloaded")
             self.assertEqual(state["full_output"]["status"], "complete")
+            completion = json.loads(
+                plan_path.with_name("completed.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                completion["part_output_files"],
+                [
+                    str(
+                        (
+                            root / "seedance" / "generated" / "part_01.mp4"
+                        ).resolve()
+                    )
+                ],
+            )
+            printed = [
+                str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            ]
+            self.assertTrue(
+                any("SEEDANCE deliverable part=1" in line for line in printed)
+            )
+            self.assertTrue(
+                any("SEEDANCE deliverable full" in line for line in printed)
+            )
 
     def test_submit_uses_private_asset_uri_for_virtual_character(self) -> None:
         from PIL import Image

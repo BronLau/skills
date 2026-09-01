@@ -35,7 +35,7 @@
   ]
 }
 
-`verified_source_facts` 必须使用与 Omni 相同的 Schema 和段级数量、顺序、边界与时长。可以依据原片纠正主体清单、段内镜头数量与时间区间、镜头内 beat 数量与连续整数时间区间，以及各视觉字段和 beat action，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。
+`verified_source_facts` 必须使用与 Omni 相同的 Schema 和段级数量、顺序、边界与时长。可以依据原片纠正主体清单、段内镜头数量与时间区间、镜头内 beat 数量与连续整数时间区间，以及各视觉字段和 beat action，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。Schema v2 中的 `audio` 必须保留每句台词的说话人、画内/画外位置、口型状态和多人闭口或重叠关系，不得退化为无归属的 `{}` 序列。
 
 严格执行用户上下文 `timeline_contract`：所有镜头和 beat 的 `start_seconds`、`end_seconds` 都必须是 JSON 整数，禁止 `7.5` 等小数；镜头在段内、beat 在镜头内必须首尾相接、没有缺口或重叠，并完整覆盖各自范围。需要调整动作边界时选择相邻的整数秒，并同步更新相关计划与 correction。
 
@@ -45,4 +45,4 @@ beat 只表达同一镜头内的动作与表情阶段变化，不得把阶段变
 
 appearance_bindings 的数量、顺序和标签必须与 verified_source_facts.subjects 完全一致，只能包含 `label` 与 `image_refs`。人物图只能绑定 `kind=character` 的主体，产品图只能绑定 `kind=product` 的主体；没有替换图的主体使用空数组。主体定义由程序生成，不能输出自由文本定义。
 
-只有用户上下文中的 `audio_permission` 明确允许改写时，`audio_overrides` 才能非空；否则必须输出空数组。非空时，每项必须且只能包含 `segment_index`、`shot_index`、`audio`：前两项必须是指向现有镜头的 JSON 整数，`audio` 必须是该镜头完整替换后的、自包含且可直接执行的声音描述字符串，不得省略镜头索引，也不得引用不会提交给 Seedance 的原片、原视频、原始音轨、原曲或参考视频。
+只有用户上下文中的 `audio_permission` 明确允许改写时，`audio_overrides` 才能非空；否则必须输出空数组。非空时，每项必须且只能包含 `segment_index`、`shot_index`、`audio`：前两项必须是指向现有镜头的 JSON 整数，`audio` 必须是该镜头完整替换后的、自包含且可直接执行的声音描述字符串，不得省略镜头索引，也不得引用不会提交给 Seedance 的原片、原视频、原始音轨、原曲或参考视频。每句台词必须使用 `<说话人>（画内、口型同步）说：{逐字台词}` 或画外对应形式，不得用引号代替 `{}`；多人对话必须说明其他画内人物自然闭口聆听或重叠发声。

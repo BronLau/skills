@@ -2487,6 +2487,17 @@ def submit(
                     future.cancel()
                 raise
     if worker_errors:
+        for key, segment_state in sorted(
+            (state.get("segments") or {}).items(), key=lambda item: int(item[0])
+        ):
+            if segment_state.get("status") == "downloaded" and segment_state.get(
+                "output_file"
+            ):
+                print(
+                    "SEEDANCE deliverable "
+                    f"part={key} file={segment_state['output_file']}",
+                    flush=True,
+                )
         detail = "; ".join(
             f"第 {index} 段：{error}" for index, error in sorted(worker_errors)
         )
@@ -2545,9 +2556,16 @@ def submit(
             "status": "complete",
             "run_id": plan["run_id"],
             "segments": len(plan["segments"]),
+            "part_output_files": [str(path) for path in part_files],
             "full_output_file": str(full_output),
         },
     )
+    for index, path in enumerate(part_files, start=1):
+        print(
+            f"SEEDANCE deliverable part={index} file={path}",
+            flush=True,
+        )
+    print(f"SEEDANCE deliverable full file={full_output}", flush=True)
     print(f"SEEDANCE complete file={completion}")
     return completion
 

@@ -113,6 +113,24 @@ QUALITY_CONSTRAINT = (
 UNAVAILABLE_AUDIO_REFERENCE_PATTERN = re.compile(
     r"原片|原视频|原始音轨|原曲|参考视频"
 )
+SUPPORTED_FACT_SCHEMA_VERSIONS = {1, 2}
+AUDIO_ATTRIBUTION_SCHEMA_VERSION = 2
+DIALOGUE_PATTERN = re.compile(r"\{(?P<text>[^{}\n]+)\}")
+ATTRIBUTED_DIALOGUE_PATTERN = re.compile(
+    r"(?P<speaker><[^<>\n]+>)"
+    r"（(?P<location>画内|画外)、(?P<sync>口型同步|无需口型)）"
+    r"(?P<delivery>[^：；。{}<>\n]{0,12})"
+    r"(?P<verb>说道|说|回应道|回应|回答道|回答|补充道|补充|"
+    r"讲解道|讲解|解释道|解释|旁白)："
+    r"\{(?P<text>[^{}\n]+)\}"
+)
+QUOTED_SPEECH_PATTERN = re.compile(
+    r"(?:说|回应|回答|补充|讲解|解释|旁白)"
+    r"[^。；\n]{0,12}[“\"][^”\"\n]+[”\"]"
+)
+EXPLICIT_NO_DIALOGUE_PATTERN = re.compile(
+    r"无对白|移除(?:全部|所有)?(?:人物)?(?:台词|对白)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,6 +257,61 @@ def integer(value: Any, label: str) -> int:
     return int(rounded)
 
 
+def dialogue_texts(audio: str) -> list[str]:
+    return [match.group("text").strip() for match in DIALOGUE_PATTERN.finditer(audio)]
+
+
+def validate_audio_description(
+    value: Any,
+    labels: set[str],
+    require_attribution: bool,
+    label: str,
+) -> str:
+    audio = str(value or "").strip()
+    if audio.count("{") != audio.count("}"):
+        raise ScriptError(f"{label}大括号不配对。")
+    if not require_attribution or not audio:
+        return audio
+    if QUOTED_SPEECH_PATTERN.search(audio):
+        raise ScriptError(f"{label}台词必须使用 {{}}，不得使用引号。")
+
+    dialogue_matches = list(DIALOGUE_PATTERN.finditer(audio))
+    attributed_matches = list(ATTRIBUTED_DIALOGUE_PATTERN.finditer(audio))
+    attributed_dialogue_spans = {
+        (match.start("text") - 1, match.end("text") + 1)
+        for match in attributed_matches
+    }
+    dialogue_spans = {match.span() for match in dialogue_matches}
+    if dialogue_spans != attributed_dialogue_spans:
+        raise ScriptError(
+            f"{label}每句 {{}}台词都必须紧邻明确的说话人、"
+            "画内/画外位置与口型状态。"
+        )
+
+    speakers: set[str] = set()
+    for match in attributed_matches:
+        speaker = match.group("speaker")
+        location = match.group("location")
+        sync = match.group("sync")
+        if speaker not in labels and speaker != "<旁白>":
+            raise ScriptError(f"{label}引用未定义说话人：{speaker}")
+        if speaker == "<旁白>" and location != "画外":
+            raise ScriptError(f"{label}<旁白>必须标记为画外。")
+        if location == "画内" and sync != "口型同步":
+            raise ScriptError(f"{label}画内说话必须标记口型同步。")
+        if location == "画外" and sync != "无需口型":
+            raise ScriptError(f"{label}画外说话必须标记无需口型。")
+        speakers.add(speaker)
+    if len(speakers - {"<旁白>"}) > 1 and not (
+        "自然闭口" in audio or "重叠发声" in audio
+    ):
+        raise ScriptError(
+            f"{label}多人对话必须说明未发言者自然闭口聆听，"
+            "或明确标记重叠发声。"
+        )
+    return audio
+
+
 def normalize_beats(
     value: Any,
     shot_start: int,
@@ -323,6 +396,9 @@ def validate_facts(
     duration_seconds: int,
     segment_max_seconds: int,
 ) -> dict[str, Any]:
+    schema_version = integer(body.get("schema_version", 1), "facts schema_version")
+    if schema_version not in SUPPORTED_FACT_SCHEMA_VERSIONS:
+        raise ScriptError(f"不支持的结构化事实 Schema：{schema_version}")
     subjects = body.get("subjects")
     segments = body.get("segments")
     if not isinstance(subjects, list) or not subjects:
@@ -396,9 +472,12 @@ def validate_facts(
                 default_beat_action(normalized_shot),
                 f"第 {segment_index} 段镜头 {shot_index}",
             )
-            audio = str(shot.get("audio") or "").strip()
-            if audio.count("{") != audio.count("}"):
-                raise ScriptError(f"第 {segment_index} 段镜头音频大括号不配对。")
+            audio = validate_audio_description(
+                shot.get("audio"),
+                labels,
+                schema_version >= AUDIO_ATTRIBUTION_SCHEMA_VERSION,
+                f"第 {segment_index} 段镜头 {shot_index} 音频：",
+            )
             if "{" in audio:
                 saw_speech = True
             normalized_shot["audio"] = audio
@@ -422,7 +501,7 @@ def validate_facts(
     if saw_speech == no_speech:
         raise ScriptError("人声事实与 no_speech_confirmed 矛盾。")
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "no_speech_confirmed": no_speech,
         "subjects": normalized_subjects,
         "segments": normalized_segments,
@@ -809,10 +888,11 @@ def validate_audio_overrides(
     if value and not allowed:
         raise ScriptError("未授权整段口播改写时 audio_overrides 必须为空。")
     shots = {
-        (int(segment["index"]), int(shot["index"]))
+        (int(segment["index"]), int(shot["index"])): shot
         for segment in facts["segments"]
         for shot in segment["shots"]
     }
+    labels = {str(subject["label"]) for subject in facts["subjects"]}
     result: dict[tuple[int, int], str] = {}
     for item in value:
         if not isinstance(item, dict):
@@ -821,14 +901,27 @@ def validate_audio_overrides(
             integer(item.get("segment_index"), "audio segment_index"),
             integer(item.get("shot_index"), "audio shot_index"),
         )
-        audio = str(item.get("audio") or "").strip()
-        if (
-            key not in shots
-            or key in result
-            or not audio
-            or audio.count("{") != audio.count("}")
-        ):
+        if key not in shots or key in result:
             raise ScriptError(f"Max audio override 无效：{key}")
+        audio = validate_audio_description(
+            item.get("audio"),
+            labels,
+            True,
+            f"Max audio override {key}：",
+        )
+        if not audio:
+            raise ScriptError(f"Max audio override 无效：{key}")
+        source_dialogues = dialogue_texts(str(shots[key].get("audio") or ""))
+        override_dialogues = dialogue_texts(audio)
+        if (
+            source_dialogues
+            and not override_dialogues
+            and not EXPLICIT_NO_DIALOGUE_PATTERN.search(audio)
+        ):
+            raise ScriptError(
+                f"Max audio override {key} 丢失了原镜头台词；"
+                "如果用户明确要求移除对白，必须在 audio 中写明无对白。"
+            )
         unavailable = UNAVAILABLE_AUDIO_REFERENCE_PATTERN.search(audio)
         if unavailable:
             raise ScriptError(
@@ -1077,7 +1170,11 @@ def build_max_messages(
             "\"shot_index\": JSON整数, \"audio\": \"完整替换音频描述\"}，"
             "并指向已存在的镜头，不得省略索引。audio 必须是 Seedance 可独立"
             "执行的具体声音描述，不得引用不会提交给 Seedance 的原片、原视频、"
-            "原始音轨、原曲或参考视频。"
+            "原始音轨、原曲或参考视频。每句台词必须使用"
+            " <说话人>（画内、口型同步）说：{逐字台词} 或"
+            " <说话人>（画外、无需口型）说：{逐字台词} 的形式；"
+            "多人对话还要明确未发言者自然闭口聆听或重叠发声。"
+            "不得用引号代替 {}，不得输出无说话人归属的台词。"
         )
     elif replacements:
         audio_permission = "audio_overrides 必须为空；程序将执行：" + "；".join(
@@ -1429,6 +1526,10 @@ def main() -> int:
                                 "audio_overrides 非空时，每项必须且只能包含整数"
                                 " segment_index、整数 shot_index 和字符串 audio；audio"
                                 " 必须自包含，不得引用不会提交给 Seedance 的原始媒体。"
+                                "每句台词必须用 <说话人>（画内、口型同步）"
+                                "说：{逐字台词} 或画外对应形式明确归属，"
+                                "多人对话明确闭口聆听或重叠发声；"
+                                "不得用引号替代 {}，不得遗漏说话人。"
                             ),
                         },
                     ],

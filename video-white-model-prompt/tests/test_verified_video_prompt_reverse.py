@@ -61,6 +61,56 @@ class VerifiedPromptTests(unittest.TestCase):
             ],
         }
 
+    @staticmethod
+    def speech_facts(audio: str | None = None, schema_version: int = 2) -> dict:
+        return {
+            "schema_version": schema_version,
+            "no_speech_confirmed": False,
+            "subjects": [
+                {
+                    "label": "<女顾客>",
+                    "kind": "character",
+                    "original_static_description": "一名坐着的短发女性",
+                },
+                {
+                    "label": "<男发型师>",
+                    "kind": "operator",
+                    "original_static_description": "一名站在女顾客身后的男性",
+                },
+            ],
+            "segments": [
+                {
+                    "index": 1,
+                    "source_start_seconds": 0,
+                    "source_end_seconds": 10,
+                    "duration_seconds": 10,
+                    "shots": [
+                        {
+                            "index": 1,
+                            "start_seconds": 0,
+                            "end_seconds": 10,
+                            "shot_scale": "中景",
+                            "camera": "固定机位",
+                            "composition": "女顾客居中，男发型师站在后方",
+                            "visible_body_range": "两人上半身",
+                            "subject_action": "女顾客先说话，男发型师随后回答",
+                            "operator_product_action": "男发型师手持喷雾瓶",
+                            "entry_exit": "无主体进出场",
+                            "scene_light": "明亮的室内环境",
+                            "audio": audio
+                            or (
+                                "<女顾客>（画内、口型同步）说：{第一句}；"
+                                "此时<男发型师>自然闭口聆听。"
+                                "随后<男发型师>（画内、口型同步）回答："
+                                "{第二句}；此时<女顾客>自然闭口聆听。"
+                                "音效：瓶身摇晃声。"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
     def make_args(self, root: Path) -> SimpleNamespace:
         video = root / "video.mp4"
         video.write_bytes(b"video")
@@ -128,6 +178,8 @@ class VerifiedPromptTests(unittest.TestCase):
             self.assertIn("shot_index", permission)
             self.assertIn("audio", permission)
             self.assertIn("JSON整数", permission)
+            self.assertIn("口型同步", permission)
+            self.assertIn("自然闭口", permission)
 
             overrides = MODULE.validate_audio_overrides(
                 [
@@ -154,6 +206,89 @@ class VerifiedPromptTests(unittest.TestCase):
                     self.facts(),
                     True,
                 )
+
+    def test_schema_v2_audio_requires_speaker_mouth_and_listener_binding(self) -> None:
+        facts = MODULE.validate_facts(self.speech_facts(), 10, 15)
+        prompt = MODULE.render_prompt(
+            facts,
+            MODULE.default_definitions(facts),
+            {},
+        )
+        self.assertEqual(facts["schema_version"], 2)
+        self.assertIn("<女顾客>（画内、口型同步）说：{第一句}", prompt)
+        self.assertIn("<男发型师>自然闭口聆听", prompt)
+        self.assertIn("音效：瓶身摇晃声", prompt)
+
+        invalid_audio = (
+            ("{第一句} {第二句}", "每句.*说话人"),
+            ("<女顾客>说：“第一句”", r"必须使用.*\{\}"),
+            (
+                "<路人>（画内、口型同步）说：{第一句}",
+                "未定义说话人",
+            ),
+            (
+                "<女顾客>（画内、口型同步）说：{第一句}；"
+                "<男发型师>（画内、口型同步）回答：{第二句}",
+                "多人对话",
+            ),
+        )
+        for audio, error in invalid_audio:
+            with self.subTest(audio=audio):
+                with self.assertRaisesRegex(MODULE.ScriptError, error):
+                    MODULE.validate_facts(self.speech_facts(audio), 10, 15)
+
+        legacy = self.speech_facts("{第一句} {第二句}", schema_version=1)
+        self.assertEqual(MODULE.validate_facts(legacy, 10, 15)["schema_version"], 1)
+
+    def test_audio_override_reuses_strict_attribution_contract(self) -> None:
+        facts = MODULE.validate_facts(self.speech_facts(), 10, 15)
+        valid = MODULE.validate_audio_overrides(
+            [
+                {
+                    "segment_index": 1,
+                    "shot_index": 1,
+                    "audio": (
+                        "<女顾客>（画内、口型同步）说：{改写后第一句}；"
+                        "此时<男发型师>自然闭口聆听。"
+                    ),
+                }
+            ],
+            facts,
+            True,
+        )
+        self.assertIn("改写后第一句", valid[(1, 1)])
+
+        for audio, error in (
+            ("{第一句}", "每句.*说话人"),
+            ("女顾客说：“第一句”", r"必须使用.*\{\}"),
+            ("原创伴奏。", "丢失了原镜头台词"),
+        ):
+            with self.subTest(audio=audio):
+                with self.assertRaisesRegex(MODULE.ScriptError, error):
+                    MODULE.validate_audio_overrides(
+                        [
+                            {
+                                "segment_index": 1,
+                                "shot_index": 1,
+                                "audio": audio,
+                            }
+                        ],
+                        facts,
+                        True,
+                    )
+
+        removed = MODULE.validate_audio_overrides(
+            [
+                {
+                    "segment_index": 1,
+                    "shot_index": 1,
+                    "audio": "无对白。环境声：安静的室内底噪。",
+                }
+            ],
+            facts,
+            True,
+        )
+        self.assertIn("无对白", removed[(1, 1)])
 
     def test_max_context_declares_aggregate_correction_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
