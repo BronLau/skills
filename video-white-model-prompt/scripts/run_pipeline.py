@@ -42,6 +42,7 @@ QWEN_SCRIPT = SKILL_DIR / "scripts" / "verified_video_prompt_reverse.py"
 SEEDANCE_SCRIPT = SKILL_DIR / "scripts" / "seedance_video_pipeline.py"
 MODEL_NAME = "depth_anything_v2_vits.onnx"
 LOCAL_MODEL_FALLBACK = Path("~/Documents/CodeX/Video/models") / MODEL_NAME
+MAX_CONFLICT_CONFIRMATION_REQUIRED = 3
 
 
 class PipelineError(RuntimeError):
@@ -69,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--product-name", default="")
     parser.add_argument("--product-image", type=Path, action="append", default=[])
+    parser.add_argument("--effect-image", type=Path, action="append", default=[])
+    parser.add_argument("--effect-reference-scope", default="")
     parser.add_argument("--character-image", type=Path)
     parser.add_argument(
         "--character-image-type",
@@ -117,6 +120,7 @@ def parse_args() -> argparse.Namespace:
         "--seedance-strip-dialogue-for-visual-only", action="store_true"
     )
     parser.add_argument("--seedance-seed", type=int)
+    parser.add_argument("--confirm-max-conflicts", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -234,6 +238,7 @@ def run_manifest(
     model: Path | None,
     character_image: Path | None,
     product_images: list[Path],
+    effect_images: list[Path],
     transcript_file: Path | None,
     reference_audio: Path | None,
 ) -> dict[str, object]:
@@ -245,6 +250,10 @@ def run_manifest(
         "segment_max_seconds": args.segment_max_seconds,
         "product_name": args.product_name.strip(),
         "product_images": [file_identity(path) for path in product_images],
+        "effect_images": [file_identity(path) for path in effect_images],
+        "effect_reference_scope": str(
+            getattr(args, "effect_reference_scope", "") or ""
+        ).strip(),
         "character_image": file_identity(character_image),
         "selling_points": args.selling_points.strip(),
         "user_idea": args.user_idea.strip(),
@@ -293,6 +302,24 @@ def write_manifest(path: Path, body: dict[str, object]) -> None:
         stream.write(serialized)
 
 
+def write_state(path: Path, body: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(body, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def validate_manifest(path: Path, expected: dict[str, object]) -> None:
     if not path.is_file():
         raise PipelineError(f"恢复运行缺少输入清单：{path}")
@@ -300,6 +327,9 @@ def validate_manifest(path: Path, expected: dict[str, object]) -> None:
         actual = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise PipelineError(f"输入清单不是有效 JSON：{path}") from exc
+    if isinstance(actual, dict):
+        actual.setdefault("effect_images", [])
+        actual.setdefault("effect_reference_scope", "")
     if actual != expected:
         raise PipelineError("恢复运行的输入视频、产品、参数或深度模型与原任务不一致。")
 
@@ -413,6 +443,27 @@ def validate_fact_lock(
         identity = body.get(key)
         if not isinstance(identity, dict) or identity.get("sha256") != file_sha256(path):
             raise PipelineError(f"{label}已变化，事实锁定记录失效。")
+    conflict_identity = body.get("max_conflict_report")
+    if conflict_identity is not None:
+        if not isinstance(conflict_identity, dict) or not body.get(
+            "max_conflicts_confirmed"
+        ):
+            raise PipelineError("Max 矛盾报告尚未获得用户确认。")
+        conflict_path_value = conflict_identity.get("path")
+        if not isinstance(conflict_path_value, str):
+            raise PipelineError("Max 矛盾报告缺少文件路径。")
+        conflict_path = Path(conflict_path_value).expanduser().resolve()
+        if (
+            not conflict_path.is_file()
+            or conflict_identity.get("sha256") != file_sha256(conflict_path)
+        ):
+            raise PipelineError("Max 矛盾报告已变化，事实锁定记录失效。")
+        try:
+            conflict_body = json.loads(conflict_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PipelineError("Max 矛盾报告不是有效 JSON。") from exc
+        if conflict_body.get("status") != "confirmed":
+            raise PipelineError("Max 矛盾报告尚未获得用户确认。")
     return body
 
 
@@ -458,6 +509,7 @@ def build_seedance_prepare_command(
     output_dir: Path,
     character_image: Path | None,
     product_images: list[Path],
+    effect_images: list[Path],
     transcript_file: Path | None,
     with_depth: bool,
     reference_audio: Path | None = None,
@@ -498,6 +550,15 @@ def build_seedance_prepare_command(
             command.append("--confirm-virtual-portrait-rights")
     for image in product_images:
         command.extend(["--product-image", str(image)])
+    for image in effect_images:
+        command.extend(["--effect-image", str(image)])
+    if effect_images:
+        command.extend(
+            [
+                "--effect-reference-scope",
+                str(getattr(args, "effect_reference_scope", "") or "").strip(),
+            ]
+        )
     if transcript_file:
         command.extend(["--transcript-file", str(transcript_file)])
     if reference_audio:
@@ -529,6 +590,8 @@ def main() -> int:
         validate_spoken_options(args)
         if args.resume and args.scope == "depth-only":
             raise PipelineError("--resume 仅支持包含 Seedance 成片的模式")
+        if bool(getattr(args, "confirm_max_conflicts", False)) and not args.resume:
+            raise PipelineError("--confirm-max-conflicts 必须与 --resume 一起使用")
         video = require_file(args.video, "参考视频")
         analysis_video = (
             require_file(args.analysis_video, "压缩分析视频")
@@ -538,7 +601,9 @@ def main() -> int:
         try:
             validate_seedance_image_count(
                 args.segment_max_seconds,
-                int(args.character_image is not None) + len(args.product_image),
+                int(args.character_image is not None)
+                + len(args.product_image)
+                + len(getattr(args, "effect_image", [])),
             )
         except MediaPreflightError as exc:
             raise PipelineError(str(exc)) from exc
@@ -546,6 +611,28 @@ def main() -> int:
             require_file(path, f"第{index}张产品图")
             for index, path in enumerate(args.product_image, start=1)
         ]
+        effect_images = [
+            require_file(path, f"第{index}张效果参考图")
+            for index, path in enumerate(
+                getattr(args, "effect_image", []), start=1
+            )
+        ]
+        effect_reference_scope = str(
+            getattr(args, "effect_reference_scope", "") or ""
+        ).strip()
+        if effect_images and not effect_reference_scope:
+            raise PipelineError(
+                "提供效果参考图时必须指定 --effect-reference-scope。"
+            )
+        if effect_reference_scope and not effect_images:
+            raise PipelineError(
+                "--effect-reference-scope 必须与 --effect-image 一起使用。"
+            )
+        if (
+            len(effect_reference_scope) > 500
+            or any(character in effect_reference_scope for character in "@{}\r\n")
+        ):
+            raise PipelineError("效果参考图作用域无效或超过 500 字。")
         character_image = (
             require_file(args.character_image, "人物形象图")
             if args.character_image
@@ -592,6 +679,7 @@ def main() -> int:
         if args.scope == "depth-only" and (
             args.product_name.strip()
             or product_images
+            or effect_images
             or character_image
             or args.character_image_type
             or args.character_asset_id
@@ -635,6 +723,11 @@ def main() -> int:
                     product_image,
                     f"第{index}张产品图",
                 )
+            for index, effect_image in enumerate(effect_images, start=1):
+                validate_seedance_image_input(
+                    effect_image,
+                    f"第{index}张效果参考图",
+                )
         output_dir = prepare_output_dir(args.output_dir, args.resume, with_depth)
         manifest_path = output_dir / "run_manifest.json"
         expected_manifest = run_manifest(
@@ -644,6 +737,7 @@ def main() -> int:
             model,
             character_image,
             product_images,
+            effect_images,
             transcript_file,
             reference_audio,
         )
@@ -697,8 +791,13 @@ def main() -> int:
 
         draft_path = output_dir / "prompt_draft.txt"
         omni_facts_path = output_dir / "omni_facts.json"
+        omni_conflicts_path = output_dir / "omni_conflicts.json"
         omni_meta_path = output_dir / "omni_facts_meta.json"
         verification_path = output_dir / "max_verification.json"
+        max_conflict_report_path = output_dir / "max_conflict_report.json"
+        awaiting_max_conflicts_path = (
+            output_dir / "awaiting_max_conflict_confirmation.json"
+        )
         candidate_path = output_dir / "prompt_candidate.txt"
         prompt_path = output_dir / "prompt.txt"
         plan_path = output_dir / "segment_plan.json"
@@ -749,6 +848,8 @@ def main() -> int:
                 str(args.segment_max_seconds),
                 "--omni-facts-output",
                 str(omni_facts_path),
+                "--omni-conflicts-output",
+                str(omni_conflicts_path),
                 "--omni-metadata-output",
                 str(omni_meta_path),
                 "--draft-output",
@@ -763,6 +864,8 @@ def main() -> int:
                 str(plan_path),
                 "--fact-lock-output",
                 str(fact_lock_path),
+                "--max-conflict-report-output",
+                str(max_conflict_report_path),
                 "--max-inline-request-mb",
                 str(args.max_inline_request_mb),
                 "--max-tokens",
@@ -777,10 +880,16 @@ def main() -> int:
                         str(omni_meta_path),
                     ]
                 )
+                if omni_conflicts_path.is_file():
+                    qwen_command.extend(
+                        ["--omni-conflicts-file", str(omni_conflicts_path)]
+                    )
             if args.resume:
                 qwen_command.append("--overwrite")
                 if candidate_path.is_file():
                     qwen_command.append("--reuse-candidate")
+            if bool(getattr(args, "confirm_max_conflicts", False)):
+                qwen_command.append("--confirm-max-conflicts")
             if key_path:
                 qwen_command.extend(["--api-key-file", str(key_path)])
             if args.product_name.strip():
@@ -908,6 +1017,29 @@ def main() -> int:
                 print("DEPTH_ENCODE provisional", flush=True)
                 encode_code = run_process(depth_encode)
 
+        if qwen_code == MAX_CONFLICT_CONFIRMATION_REQUIRED:
+            if depth_code != 0 or encode_code != 0:
+                raise PipelineError(
+                    "Max 矛盾报告已生成，但白模准备未成功："
+                    f"depth_infer={depth_code}, depth_encode={encode_code}"
+                )
+            require_file(max_conflict_report_path, "待确认 Max 矛盾报告")
+            write_state(
+                awaiting_max_conflicts_path,
+                {
+                    "schema_version": 1,
+                    "status": "awaiting_user_confirmation",
+                    "authoritative_model": "qwen3.8-max",
+                    "report": str(max_conflict_report_path),
+                },
+            )
+            print(
+                "PIPELINE awaiting_max_conflict_confirmation "
+                f"report={max_conflict_report_path}",
+                flush=True,
+            )
+            return 0
+
         if qwen_code == 0 and depth_code == 0 and encode_code == 0:
             seedance_prepare = build_seedance_prepare_command(
                 args,
@@ -918,6 +1050,7 @@ def main() -> int:
                 output_dir,
                 character_image,
                 product_images,
+                effect_images,
                 transcript_file,
                 with_depth,
                 reference_audio,
@@ -936,6 +1069,16 @@ def main() -> int:
                     "seedance_plan": str(seedance_plan_path),
                 },
             )
+            if awaiting_max_conflicts_path.is_file():
+                write_state(
+                    awaiting_max_conflicts_path,
+                    {
+                        "schema_version": 1,
+                        "status": "confirmed",
+                        "authoritative_model": "qwen3.8-max",
+                        "report": str(max_conflict_report_path),
+                    },
+                )
             return 0
 
         encode_status = "skipped" if encode_code is None else str(encode_code)

@@ -45,6 +45,7 @@ PROMPT_DIR = SCRIPT_DIR.parent / "prompts"
 DEFAULT_OMNI_PROMPT = PROMPT_DIR / "video_reverse_omni_facts_system.txt"
 DEFAULT_MAX_PROMPT = PROMPT_DIR / "video_reverse_max_verify_appearance_system.txt"
 MIN_SEGMENT_SECONDS = 4
+MAX_CONFLICT_CONFIRMATION_REQUIRED = 3
 VISUAL_FIELDS = (
     "shot_scale",
     "camera",
@@ -93,6 +94,22 @@ CORRECTION_PATH_CONTRACT = {
         "path": "segments[i].shots[j].beat_actions",
         "value_shape": "完整 beat action 数组",
     },
+    "no_speech_confirmed": {
+        "when": "Omni 对是否存在可辨识人声的判断与原片或逐字台词不一致",
+        "path": "no_speech_confirmed",
+        "value_shape": "JSON 布尔值",
+    },
+    "audio_plan": {
+        "when": "shot_plan 变化且镜头音频归属或内容同时变化",
+        "path": "segments[i].audio_plan",
+        "value_shape": "完整音频计划数组，每项只含 index、start_seconds、end_seconds、audio",
+        "value_fields": ["index", "start_seconds", "end_seconds", "audio"],
+    },
+    "shot_audio": {
+        "when": "shot_plan 不变，仅单个镜头的原片音频事实变化",
+        "path": "segments[i].shots[j].audio",
+        "value_shape": "该镜头完整 audio 字符串",
+    },
 }
 TIMELINE_CONTRACT = {
     "time_type": "JSON整数",
@@ -123,6 +140,13 @@ ATTRIBUTED_DIALOGUE_PATTERN = re.compile(
     r"(?P<verb>说道|说|回应道|回应|回答道|回答|补充道|补充|"
     r"讲解道|讲解|解释道|解释|旁白)："
     r"\{(?P<text>[^{}\n]+)\}"
+)
+ATTRIBUTED_SPEECH_PREFIX_PATTERN = re.compile(
+    r"<[^<>\n]+>"
+    r"（(?:画内|画外)、(?:口型同步|无需口型)）"
+    r"[^：；。{}<>\n]{0,12}"
+    r"(?:说道|说|回应道|回应|回答道|回答|补充道|补充|"
+    r"讲解道|讲解|解释道|解释|旁白)："
 )
 QUOTED_SPEECH_PATTERN = re.compile(
     r"(?:说|回应|回答|补充|讲解|解释|旁白)"
@@ -159,6 +183,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-system-prompt", type=Path, default=DEFAULT_MAX_PROMPT)
     parser.add_argument("--omni-facts-output", type=Path, required=True)
     parser.add_argument("--omni-facts-file", type=Path)
+    parser.add_argument("--omni-conflicts-output", type=Path, required=True)
+    parser.add_argument("--omni-conflicts-file", type=Path)
     parser.add_argument("--omni-metadata-output", type=Path, required=True)
     parser.add_argument("--omni-metadata-file", type=Path)
     parser.add_argument("--draft-output", type=Path, required=True)
@@ -167,6 +193,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--segment-plan-output", type=Path, required=True)
     parser.add_argument("--fact-lock-output", type=Path, required=True)
+    parser.add_argument("--max-conflict-report-output", type=Path, required=True)
+    parser.add_argument("--confirm-max-conflicts", action="store_true")
     parser.add_argument("--omni-request-body-output", type=Path)
     parser.add_argument("--omni-response-body-output", type=Path)
     parser.add_argument("--max-request-body-output", type=Path)
@@ -195,6 +223,52 @@ def read_text(path: Path, label: str) -> str:
     if not value:
         raise ScriptError(f"{label}内容为空：{resolved}")
     return value
+
+
+def reuse_captured_omni_response(
+    request_path: Path | None,
+    response_path: Path | None,
+    expected_payload: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    if request_path is None or response_path is None:
+        return None
+    request_resolved = request_path.expanduser().resolve()
+    response_resolved = response_path.expanduser().resolve()
+    if not request_resolved.is_file() or not response_resolved.is_file():
+        return None
+    try:
+        saved_request = json.loads(request_resolved.read_text(encoding="utf-8"))
+        saved_response = json.loads(response_resolved.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ScriptError("已有 Omni 调试请求或响应不是有效 JSON。") from exc
+    if saved_request != expected_payload:
+        return None
+    chunks = saved_response.get("chunks") if isinstance(saved_response, dict) else None
+    if not isinstance(chunks, list):
+        raise ScriptError("已有 Omni 调试响应缺少 chunks。")
+    parts: list[str] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        choices = chunk.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        content = delta.get("content") if isinstance(delta, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+    text = "".join(parts).strip()
+    if not text:
+        raise ScriptError("已有 Omni 调试响应没有可复用文本。")
+    print("OMNI_CAPTURE_REUSE accepted", flush=True)
+    return text, saved_response
 
 
 def file_sha256(path: Path) -> str:
@@ -277,6 +351,12 @@ def validate_audio_description(
 
     dialogue_matches = list(DIALOGUE_PATTERN.finditer(audio))
     attributed_matches = list(ATTRIBUTED_DIALOGUE_PATTERN.finditer(audio))
+    if not dialogue_matches and ATTRIBUTED_SPEECH_PREFIX_PATTERN.search(audio):
+        raise ScriptError(
+            f"{label}检测到说话描述，但逐字台词没有使用 {{}}；"
+            "必须按 <说话人>（画内、口型同步）说：{逐字台词} "
+            "或画外对应形式输出。"
+        )
     attributed_dialogue_spans = {
         (match.start("text") - 1, match.end("text") + 1)
         for match in attributed_matches
@@ -395,7 +475,11 @@ def validate_facts(
     body: dict[str, Any],
     duration_seconds: int,
     segment_max_seconds: int,
+    *,
+    allow_audio_conflicts: bool = False,
+    conflicts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    conflict_items = conflicts if conflicts is not None else []
     schema_version = integer(body.get("schema_version", 1), "facts schema_version")
     if schema_version not in SUPPORTED_FACT_SCHEMA_VERSIONS:
         raise ScriptError(f"不支持的结构化事实 Schema：{schema_version}")
@@ -472,12 +556,28 @@ def validate_facts(
                 default_beat_action(normalized_shot),
                 f"第 {segment_index} 段镜头 {shot_index}",
             )
-            audio = validate_audio_description(
-                shot.get("audio"),
-                labels,
-                schema_version >= AUDIO_ATTRIBUTION_SCHEMA_VERSION,
-                f"第 {segment_index} 段镜头 {shot_index} 音频：",
-            )
+            raw_audio = str(shot.get("audio") or "").strip()
+            try:
+                audio = validate_audio_description(
+                    raw_audio,
+                    labels,
+                    schema_version >= AUDIO_ATTRIBUTION_SCHEMA_VERSION,
+                    f"第 {segment_index} 段镜头 {shot_index} 音频：",
+                )
+            except ScriptError as error:
+                if not allow_audio_conflicts:
+                    raise
+                audio = raw_audio
+                conflict_items.append(
+                    {
+                        "path": (
+                            f"segments[{segment_index - 1}].shots["
+                            f"{shot_index - 1}].audio"
+                        ),
+                        "omni_value": raw_audio,
+                        "issue": str(error),
+                    }
+                )
             if "{" in audio:
                 saw_speech = True
             normalized_shot["audio"] = audio
@@ -499,13 +599,45 @@ def validate_facts(
         raise ScriptError("结构化事实没有覆盖完整目标时长。")
     no_speech = bool(body.get("no_speech_confirmed"))
     if saw_speech == no_speech:
-        raise ScriptError("人声事实与 no_speech_confirmed 矛盾。")
+        issue = (
+            "no_speech_confirmed=false，但 audio 中没有可机器识别的 "
+            "{逐字台词}。"
+            if not no_speech
+            else "no_speech_confirmed=true，但 audio 中存在 {逐字台词}。"
+        )
+        if not allow_audio_conflicts:
+            raise ScriptError(issue)
+        conflict_items.append(
+            {
+                "path": "no_speech_confirmed",
+                "omni_value": no_speech,
+                "issue": issue,
+            }
+        )
     return {
         "schema_version": schema_version,
         "no_speech_confirmed": no_speech,
         "subjects": normalized_subjects,
         "segments": normalized_segments,
     }
+
+
+def validate_facts_for_max_arbitration(
+    body: dict[str, Any],
+    duration_seconds: int,
+    segment_max_seconds: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    conflicts: list[dict[str, Any]] = []
+    facts = validate_facts(
+        body,
+        duration_seconds,
+        segment_max_seconds,
+        allow_audio_conflicts=True,
+        conflicts=conflicts,
+    )
+    if not conflicts:
+        raise ScriptError("Max 仲裁模式没有检测到可恢复的 Omni 音频矛盾。")
+    return facts, conflicts
 
 
 def segment_structure(facts: dict[str, Any]) -> list[tuple[Any, ...]]:
@@ -558,7 +690,11 @@ def aggregate_segment_evidence_times(
 
 
 def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[str, list[float]]:
-    result: dict[str, list[float]] = {}
+    result: dict[str, list[float]] = {
+        "no_speech_confirmed": list(
+            evidence_times(0, source_duration, source_duration)
+        )
+    }
     for segment_pos, segment in enumerate(facts["segments"]):
         segment_start = float(segment["source_start_seconds"])
         segment_end = float(segment["source_end_seconds"])
@@ -572,6 +708,7 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
         )
         result[segment_path + ".shot_plan"] = aggregate_allowed
         result[segment_path + ".shot_visuals"] = aggregate_allowed
+        result[segment_path + ".audio_plan"] = aggregate_allowed
         for shot_pos, shot in enumerate(segment["shots"]):
             shot_path = f"segments[{segment_pos}].shots[{shot_pos}]"
             shot_allowed = list(
@@ -584,6 +721,7 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
             result[shot_path] = shot_allowed
             result[shot_path + ".beat_plan"] = shot_allowed
             result[shot_path + ".beat_actions"] = shot_allowed
+            result[shot_path + ".audio"] = shot_allowed
             for beat_pos, beat in enumerate(shot.get("beats") or []):
                 beat_start = segment_start + float(beat["start_seconds"])
                 beat_end = segment_start + float(beat["end_seconds"])
@@ -607,17 +745,16 @@ def visual_differences(
             verified["subjects"],
             evidence_times(0, source_duration, source_duration),
         )
+    if omni["no_speech_confirmed"] != verified["no_speech_confirmed"]:
+        differences["no_speech_confirmed"] = (
+            omni["no_speech_confirmed"],
+            verified["no_speech_confirmed"],
+            evidence_times(0, source_duration, source_duration),
+        )
     for segment_pos, (omni_segment, verified_segment) in enumerate(
         zip(omni["segments"], verified["segments"])
     ):
         source_offset = float(omni_segment["source_start_seconds"])
-        source_end = float(omni_segment["source_end_seconds"])
-        omni_audio = "".join(str(shot["audio"]) for shot in omni_segment["shots"])
-        verified_audio = "".join(
-            str(shot["audio"]) for shot in verified_segment["shots"]
-        )
-        if omni_audio != verified_audio:
-            raise ScriptError("Max 不得修改 Omni 音频事实；音频改写走 audio_overrides。")
         omni_plan = [
             {
                 "index": shot["index"],
@@ -664,12 +801,46 @@ def visual_differences(
                     verified_visuals,
                     allowed,
                 )
+            omni_audio_plan = [
+                {
+                    "index": shot["index"],
+                    "start_seconds": shot["start_seconds"],
+                    "end_seconds": shot["end_seconds"],
+                    "audio": shot["audio"],
+                }
+                for shot in omni_segment["shots"]
+            ]
+            verified_audio_plan = [
+                {
+                    "index": shot["index"],
+                    "start_seconds": shot["start_seconds"],
+                    "end_seconds": shot["end_seconds"],
+                    "audio": shot["audio"],
+                }
+                for shot in verified_segment["shots"]
+            ]
+            if omni_audio_plan != verified_audio_plan:
+                differences[f"segments[{segment_pos}].audio_plan"] = (
+                    omni_audio_plan,
+                    verified_audio_plan,
+                    allowed,
+                )
             continue
         for shot_pos, (omni_shot, verified_shot) in enumerate(
             zip(omni_segment["shots"], verified_segment["shots"])
         ):
             if omni_shot["audio"] != verified_shot["audio"]:
-                raise ScriptError("Max 不得修改 Omni 音频事实；音频改写走 audio_overrides。")
+                differences[
+                    f"segments[{segment_pos}].shots[{shot_pos}].audio"
+                ] = (
+                    omni_shot["audio"],
+                    verified_shot["audio"],
+                    aggregate_shot_evidence_times(
+                        source_offset,
+                        omni_shot,
+                        source_duration,
+                    ),
+                )
             shot_allowed = aggregate_shot_evidence_times(
                 source_offset,
                 omni_shot,
@@ -790,6 +961,118 @@ def validate_corrections(
     if (status == "unchanged") != (not differences):
         raise ScriptError("Max fact_review status 与实际事实变化不一致。")
     return normalized
+
+
+def select_derived_evidence_times(
+    path: str,
+    before: Any,
+    after: Any,
+    allowed_times: tuple[float, ...],
+) -> list[float]:
+    if path.endswith(".beat_actions") and isinstance(before, list) and isinstance(after, list):
+        item_count = max(len(before), len(after))
+        changed_indices = [
+            index
+            for index in range(item_count)
+            if (before[index] if index < len(before) else None)
+            != (after[index] if index < len(after) else None)
+        ]
+        if changed_indices and allowed_times:
+            start = int(min(changed_indices) * len(allowed_times) / item_count)
+            end = int((max(changed_indices) + 1) * len(allowed_times) / item_count)
+            selected = [float(value) for value in allowed_times[start:max(end, start + 1)]]
+            if len(set(selected)) >= min(2, len(allowed_times)):
+                return selected
+
+    if path.endswith((".shot_plan", ".beat_plan", ".audio_plan")):
+        changed_times: set[float] = set()
+        before_items = before if isinstance(before, list) else []
+        after_items = after if isinstance(after, list) else []
+        before_by_index = {
+            item.get("index"): item
+            for item in before_items
+            if isinstance(item, dict)
+        }
+        after_by_index = {
+            item.get("index"): item
+            for item in after_items
+            if isinstance(item, dict)
+        }
+        for index in set(before_by_index) | set(after_by_index):
+            before_item = before_by_index.get(index) or {}
+            after_item = after_by_index.get(index) or {}
+            if before_item == after_item:
+                continue
+            for key in ("start_seconds", "end_seconds"):
+                before_value = before_item.get(key)
+                after_value = after_item.get(key)
+                if before_value == after_value:
+                    continue
+                for value in (before_value, after_value):
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        changed_times.add(float(value))
+        matched = [
+            float(allowed)
+            for allowed in allowed_times
+            if any(abs(float(allowed) - value) <= 0.001 for value in changed_times)
+        ]
+        if changed_times:
+            for changed in sorted(changed_times):
+                nearest = min(
+                    allowed_times,
+                    key=lambda allowed: abs(float(allowed) - changed),
+                )
+                matched.append(float(nearest))
+            matched = list(dict.fromkeys(matched))
+        if len(set(matched)) >= min(2, len(allowed_times)):
+            return matched
+
+    if len(allowed_times) <= 3:
+        return [float(value) for value in allowed_times]
+    middle = allowed_times[len(allowed_times) // 2]
+    return list(
+        dict.fromkeys(
+            [float(allowed_times[0]), float(middle), float(allowed_times[-1])]
+        )
+    )
+
+
+def resolve_corrections(
+    review: Any,
+    differences: dict[str, tuple[Any, Any, tuple[float, ...]]],
+) -> list[dict[str, Any]]:
+    try:
+        if not isinstance(review, dict):
+            raise ScriptError("Max fact_review 不是对象。")
+        return validate_corrections(review, differences)
+    except ScriptError as error:
+        if not differences:
+            raise
+        print(
+            f"MAX_CORRECTIONS_DERIVED reason={error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        derived: list[dict[str, Any]] = []
+        for path, (before, after, allowed_times) in differences.items():
+            derived.append(
+                {
+                    "path": path,
+                    "omni_value": before,
+                    "corrected_value": after,
+                    "evidence_times": select_derived_evidence_times(
+                        path,
+                        before,
+                        after,
+                        allowed_times,
+                    ),
+                    "evidence_description": (
+                        "Qwen 3.8 Max verified_source_facts 与 Omni 在该字段"
+                        "不一致；程序按对应原片允许采样点生成待用户确认项。"
+                    ),
+                }
+            )
+        return derived
 
 
 def validate_appearance_bindings(
@@ -962,7 +1245,7 @@ def validate_max_result(
         segment_max_seconds,
     )
     differences = visual_differences(omni, verified, source_duration_seconds)
-    corrections = validate_corrections(body["fact_review"], differences)
+    corrections = resolve_corrections(body["fact_review"], differences)
     definitions = validate_appearance_bindings(
         body["appearance_bindings"],
         verified,
@@ -1147,6 +1430,8 @@ def build_max_messages(
     source_duration: float,
     character_reference: str | None,
     product_references: list[str],
+    omni_conflicts: list[dict[str, Any]] | None = None,
+    transcript: str = "",
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [
         {
@@ -1184,6 +1469,13 @@ def build_max_messages(
         audio_permission = "audio_overrides 必须为空。"
     context = {
         "omni_source_facts": omni,
+        "omni_validation_conflicts": omni_conflicts or [],
+        "transcript": transcript or None,
+        "source_fact_authority": (
+            "Qwen 3.8 Max 是矛盾仲裁结果。可依据原片和 transcript 修正 "
+            "verified_source_facts 中的音频事实与 no_speech_confirmed；"
+            "所有变化必须进入 fact_review.corrections。"
+        ),
         "allowed_evidence_times": evidence_time_index(omni, source_duration),
         "correction_path_contract": CORRECTION_PATH_CONTRACT,
         "timeline_contract": TIMELINE_CONTRACT,
@@ -1224,6 +1516,65 @@ def input_metadata(
     }
 
 
+def read_omni_conflicts(path: Path) -> list[dict[str, Any]]:
+    resolved = require_readable_file(path, "Omni 矛盾记录")
+    try:
+        body = json.loads(resolved.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ScriptError("Omni 矛盾记录不是有效 JSON。") from exc
+    conflicts = body.get("conflicts") if isinstance(body, dict) else None
+    if not isinstance(conflicts, list) or any(
+        not isinstance(item, dict) for item in conflicts
+    ):
+        raise ScriptError("Omni 矛盾记录缺少 conflicts 数组。")
+    return conflicts
+
+
+def build_max_conflict_report(
+    args: argparse.Namespace,
+    video: Path,
+    transcript: Path | None,
+    max_candidate_text: str,
+    verification_path: Path,
+    omni_conflicts: list[dict[str, Any]],
+    corrections: list[dict[str, Any]],
+    status: str,
+) -> dict[str, Any]:
+    if status not in {"pending_user_confirmation", "confirmed"}:
+        raise ScriptError(f"Max 矛盾报告状态无效：{status}")
+    return {
+        "schema_version": 1,
+        "status": status,
+        "authoritative_model": args.model,
+        "resolution_policy": "max_authoritative_after_conflict",
+        "analysis_video": file_identity(video),
+        "transcript": file_identity(transcript),
+        "max_candidate_sha256": text_sha256(max_candidate_text),
+        "max_verification": {
+            "path": str(verification_path.resolve()),
+            "sha256": file_sha256(verification_path.resolve()),
+        },
+        "omni_validation_conflicts": omni_conflicts,
+        "max_corrections": corrections,
+    }
+
+
+def validate_existing_conflict_report(
+    path: Path,
+    expected: dict[str, Any],
+) -> None:
+    resolved = require_readable_file(path, "待确认 Max 矛盾报告")
+    try:
+        actual = json.loads(resolved.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ScriptError("待确认 Max 矛盾报告不是有效 JSON。") from exc
+    if not isinstance(actual, dict):
+        raise ScriptError("待确认 Max 矛盾报告根节点必须是对象。")
+    actual = {**actual, "status": "pending_user_confirmation"}
+    if actual != expected:
+        raise ScriptError("Max 候选、输入或矛盾内容已变化，必须重新展示并确认。")
+
+
 def fact_lock(
     args: argparse.Namespace,
     video: Path,
@@ -1231,8 +1582,9 @@ def fact_lock(
     verification_path: Path,
     prompt: str,
     plan_path: Path,
+    conflict_report_path: Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    body = {
         "schema_version": 2,
         "status": "locked",
         "assembly_mode": "deterministic_from_max_verified_facts",
@@ -1247,6 +1599,10 @@ def fact_lock(
         "max_model": args.model,
         "fps": args.fps,
     }
+    if conflict_report_path is not None:
+        body["max_conflict_report"] = file_identity(conflict_report_path)
+        body["max_conflicts_confirmed"] = True
+    return body
 
 
 def main() -> int:
@@ -1256,6 +1612,8 @@ def main() -> int:
             raise ScriptError("--fps 必须在 0.1 到 10 之间。")
         if args.allow_audio_rewrite and args.spoken_replacement:
             raise ScriptError("--allow-audio-rewrite 与 --spoken-replacement 不能同时使用。")
+        if args.confirm_max_conflicts and not args.overwrite:
+            raise ScriptError("--confirm-max-conflicts 只能在恢复运行中使用。")
         try:
             validate_seedance_image_count(
                 args.segment_max_seconds,
@@ -1298,6 +1656,7 @@ def main() -> int:
         resolver = MediaResolver(args)
         video_reference = resolver.resolve(video, "video")
 
+        omni_conflicts: list[dict[str, Any]] = []
         if args.omni_facts_file:
             omni_path = require_readable_file(args.omni_facts_file, "Omni 事实")
             meta_path = require_readable_file(
@@ -1306,11 +1665,30 @@ def main() -> int:
             )
             if json.loads(meta_path.read_text(encoding="utf-8")) != expected_meta:
                 raise ScriptError("Omni 事实元数据与当前原片输入不一致。")
-            omni = validate_facts(
-                json.loads(omni_path.read_text(encoding="utf-8")),
-                duration_seconds,
-                args.segment_max_seconds,
-            )
+            omni_body = json.loads(omni_path.read_text(encoding="utf-8"))
+            if args.omni_conflicts_file:
+                saved_conflicts = read_omni_conflicts(args.omni_conflicts_file)
+                if saved_conflicts:
+                    omni, detected_conflicts = validate_facts_for_max_arbitration(
+                        omni_body,
+                        duration_seconds,
+                        args.segment_max_seconds,
+                    )
+                    if detected_conflicts != saved_conflicts:
+                        raise ScriptError("Omni 事实与已保存的矛盾记录不一致。")
+                    omni_conflicts = saved_conflicts
+                else:
+                    omni = validate_facts(
+                        omni_body,
+                        duration_seconds,
+                        args.segment_max_seconds,
+                    )
+            else:
+                omni = validate_facts(
+                    omni_body,
+                    duration_seconds,
+                    args.segment_max_seconds,
+                )
         else:
             if not api_key:
                 raise ScriptError("未设置 DASHSCOPE_API_KEY 或 --api-key-file。")
@@ -1338,15 +1716,28 @@ def main() -> int:
                     args.overwrite,
                     "Omni 请求体",
                 )
-            raw_omni, omni_response = call_omni(
-                args.base_url,
-                api_key,
-                omni_payload,
-                args.timeout,
-                args.retries,
-                capture_chunks=bool(args.omni_response_body_output),
+            captured = (
+                reuse_captured_omni_response(
+                    args.omni_request_body_output,
+                    args.omni_response_body_output,
+                    omni_payload,
+                )
+                if args.overwrite
+                else None
             )
-            if args.omni_response_body_output:
+            captured_reused = captured is not None
+            if captured is None:
+                raw_omni, omni_response = call_omni(
+                    args.base_url,
+                    api_key,
+                    omni_payload,
+                    args.timeout,
+                    args.retries,
+                    capture_chunks=bool(args.omni_response_body_output),
+                )
+            else:
+                raw_omni, omni_response = captured
+            if args.omni_response_body_output and not captured_reused:
                 write_json_output(
                     args.omni_response_body_output,
                     omni_response,
@@ -1357,44 +1748,75 @@ def main() -> int:
                 str(omni_response.get("finish_reason") or ""),
                 "Omni 结构化事实",
             )
+            omni_body = parse_json_object(raw_omni, "Omni 事实")
             try:
                 omni = validate_facts(
-                    parse_json_object(raw_omni, "Omni 事实"),
+                    omni_body,
                     duration_seconds,
                     args.segment_max_seconds,
                 )
             except ScriptError as error:
-                repair_payload = {
-                    **omni_payload,
-                    "messages": [
-                        *omni_messages,
-                        {"role": "assistant", "content": raw_omni},
-                        {
-                            "role": "user",
-                            "content": f"机器校验失败：{error}\n重新核对原片并完整输出修复 JSON。",
-                        },
-                    ],
-                    "temperature": 0.1,
-                }
-                raw_omni, omni_response = call_omni(
-                    args.base_url,
-                    api_key,
-                    repair_payload,
-                    args.timeout,
-                    args.retries,
-                    capture_chunks=False,
-                )
-                omni = validate_facts(
-                    parse_json_object(raw_omni, "Omni 修复事实"),
-                    duration_seconds,
-                    args.segment_max_seconds,
-                )
+                if captured_reused:
+                    omni, omni_conflicts = validate_facts_for_max_arbitration(
+                        omni_body,
+                        duration_seconds,
+                        args.segment_max_seconds,
+                    )
+                else:
+                    repair_payload = {
+                        **omni_payload,
+                        "messages": [
+                            *omni_messages,
+                            {"role": "assistant", "content": raw_omni},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"机器校验失败：{error}\n"
+                                    "重新核对原片并完整输出修复 JSON。"
+                                ),
+                            },
+                        ],
+                        "temperature": 0.1,
+                    }
+                    raw_omni, omni_response = call_omni(
+                        args.base_url,
+                        api_key,
+                        repair_payload,
+                        args.timeout,
+                        args.retries,
+                        capture_chunks=False,
+                    )
+                    repaired_body = parse_json_object(raw_omni, "Omni 修复事实")
+                    try:
+                        omni = validate_facts(
+                            repaired_body,
+                            duration_seconds,
+                            args.segment_max_seconds,
+                        )
+                    except ScriptError:
+                        omni, omni_conflicts = validate_facts_for_max_arbitration(
+                            repaired_body,
+                            duration_seconds,
+                            args.segment_max_seconds,
+                        )
 
         write_json_output(
             args.omni_facts_output,
             omni,
             args.overwrite,
             "Omni 事实",
+        )
+        write_json_output(
+            args.omni_conflicts_output,
+            {
+                "schema_version": 1,
+                "status": (
+                    "requires_max_arbitration" if omni_conflicts else "none"
+                ),
+                "conflicts": omni_conflicts,
+            },
+            args.overwrite,
+            "Omni 矛盾记录",
         )
         write_json_output(
             args.omni_metadata_output,
@@ -1416,6 +1838,7 @@ def main() -> int:
             dict[tuple[int, int], str],
             list[dict[str, Any]],
         ] | None = None
+        max_candidate_text: str | None = None
         candidate_path = args.candidate_output.expanduser().resolve()
         if args.reuse_candidate and candidate_path.is_file():
             try:
@@ -1438,6 +1861,7 @@ def main() -> int:
                     flush=True,
                 )
             else:
+                max_candidate_text = raw_candidate
                 print("MAX_CANDIDATE_REUSE accepted", flush=True)
 
         if max_result is None:
@@ -1455,6 +1879,8 @@ def main() -> int:
                 source_duration,
                 character_reference,
                 product_references,
+                omni_conflicts,
+                transcript,
             )
             max_payload = {
                 "model": args.model,
@@ -1486,6 +1912,7 @@ def main() -> int:
                     "Max 响应体",
                 )
             require_complete_finish(completion_finish_reason(max_response), "Max 原片核验")
+            max_candidate_text = raw_max
             write_text_output(
                 args.candidate_output,
                 raw_max,
@@ -1522,7 +1949,12 @@ def main() -> int:
                                 "严格执行 timeline_contract，所有镜头与 beat 的起止时间必须是"
                                 " JSON 整数并连续完整覆盖，禁止任何小数秒；"
                                 "不得使用单个 start_seconds 或 end_seconds 路径，也不得申报无实际差异的字段。"
-                                "只允许修正有时间证据的视觉字段、静态外观绑定和授权音频。"
+                                "只允许修正有时间证据的原片事实与静态外观绑定；"
+                                "原片音频事实或 no_speech_confirmed 变化必须作为"
+                                " correction 明确记录；镜头计划不变时音频使用"
+                                " segments[i].shots[j].audio，计划变化时使用"
+                                " segments[i].audio_plan，人声存在性使用"
+                                " no_speech_confirmed。创意改写仍只能走 audio_overrides。"
                                 "audio_overrides 非空时，每项必须且只能包含整数"
                                 " segment_index、整数 shot_index 和字符串 audio；audio"
                                 " 必须自包含，不得引用不会提交给 Seedance 的原始媒体。"
@@ -1546,6 +1978,7 @@ def main() -> int:
                     completion_finish_reason(max_response),
                     "Max 原片核验修复",
                 )
+                max_candidate_text = raw_max
                 write_text_output(
                     args.candidate_output,
                     raw_max,
@@ -1565,20 +1998,9 @@ def main() -> int:
                 )
 
         verified, bindings, overrides, corrections = max_result
+        if max_candidate_text is None:
+            raise ScriptError("内部错误：缺少 Max 核验候选文本。")
 
-        replacements = parse_spoken_replacements(args.spoken_replacement)
-        if replacements:
-            apply_word_replacements(verified, replacements)
-        definitions = definitions_from_bindings(verified, bindings)
-        final_prompt = render_prompt(verified, definitions, overrides)
-        segment_plan = validate_prompt_contract(
-            final_prompt,
-            duration_seconds,
-            source_duration,
-            args.segment_max_seconds,
-            expected_images,
-            "确定性组装终稿",
-        )
         verification = {
             "schema_version": 1,
             "fact_review": {
@@ -1605,6 +2027,69 @@ def main() -> int:
             args.overwrite,
             "Max 核验结果",
         )
+
+        conflict_report_path: Path | None = None
+        has_conflicts = bool(omni_conflicts or corrections)
+        if has_conflicts:
+            pending_report = build_max_conflict_report(
+                args,
+                video,
+                transcript_path,
+                max_candidate_text,
+                args.verification_output.resolve(),
+                omni_conflicts,
+                corrections,
+                "pending_user_confirmation",
+            )
+            report_path = args.max_conflict_report_output.expanduser().resolve()
+            if args.confirm_max_conflicts:
+                if not report_path.is_file():
+                    raise ScriptError("缺少已向用户展示的待确认 Max 矛盾报告。")
+                validate_existing_conflict_report(report_path, pending_report)
+                write_json_output(
+                    report_path,
+                    {**pending_report, "status": "confirmed"},
+                    True,
+                    "已确认 Max 矛盾报告",
+                )
+                conflict_report_path = report_path
+            else:
+                write_json_output(
+                    report_path,
+                    pending_report,
+                    args.overwrite,
+                    "待确认 Max 矛盾报告",
+                )
+                print(
+                    "MAX_CONFLICT_CONFIRMATION_REQUIRED "
+                    + json.dumps(
+                        {
+                            "report": str(report_path),
+                            "omni_validation_conflicts": len(omni_conflicts),
+                            "max_corrections": len(corrections),
+                            "authoritative_model": args.model,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                return MAX_CONFLICT_CONFIRMATION_REQUIRED
+        elif args.confirm_max_conflicts:
+            raise ScriptError("当前没有需要确认的 Max 矛盾。")
+
+        replacements = parse_spoken_replacements(args.spoken_replacement)
+        if replacements:
+            apply_word_replacements(verified, replacements)
+        definitions = definitions_from_bindings(verified, bindings)
+        final_prompt = render_prompt(verified, definitions, overrides)
+        segment_plan = validate_prompt_contract(
+            final_prompt,
+            duration_seconds,
+            source_duration,
+            args.segment_max_seconds,
+            expected_images,
+            "确定性组装终稿",
+        )
         write_text_output(
             args.candidate_output,
             final_prompt,
@@ -1626,6 +2111,7 @@ def main() -> int:
                 args.verification_output.resolve(),
                 final_prompt,
                 args.segment_plan_output.resolve(),
+                conflict_report_path,
             ),
             args.overwrite,
             "事实锁定记录",

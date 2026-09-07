@@ -139,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--character-asset-id")
     prepare.add_argument("--confirm-virtual-portrait-rights", action="store_true")
     prepare.add_argument("--product-image", type=Path, action="append", default=[])
+    prepare.add_argument("--effect-image", type=Path, action="append", default=[])
+    prepare.add_argument("--effect-reference-scope", default="")
     prepare.add_argument("--transcript-file", type=Path)
     prepare.add_argument("--reference-audio", type=Path)
     prepare.add_argument("--confirm-voice-rights", action="store_true")
@@ -224,7 +226,7 @@ def validate_character_reference_plan(
     character_images = []
     for image in images:
         role = str(image.get("reference_role") or "")
-        if role not in {"character", "product"}:
+        if role not in {"character", "product", "effect"}:
             raise SeedanceError(f"Seedance 图片参考角色无效：{role or '空'}")
         if role == "character":
             character_images.append(image)
@@ -250,6 +252,33 @@ def validate_character_reference_plan(
     return reference
 
 
+def validate_effect_reference_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
+    effect_images = [
+        image
+        for image in plan.get("images") or []
+        if str(image.get("reference_role") or "") == "effect"
+    ]
+    reference = plan.get("effect_reference")
+    if not effect_images:
+        if reference is not None:
+            raise SeedanceError("计划包含效果引用配置，但没有效果参考图。")
+        return None
+    if not isinstance(reference, dict):
+        raise SeedanceError("效果参考图缺少独立作用域配置。")
+    expected_ids = [str(image.get("id") or "") for image in effect_images]
+    if reference.get("image_ids") != expected_ids:
+        raise SeedanceError("效果引用配置与效果参考图 ID 不一致。")
+    scope = str(reference.get("scope") or "").strip()
+    if (
+        not scope
+        or len(scope) > 500
+        or any(character in scope for character in "@{}\r\n")
+        or not bool(reference.get("identity_excluded"))
+    ):
+        raise SeedanceError("效果参考图作用域或身份排除配置无效。")
+    return reference
+
+
 def plan_requires_storage(
     plan: dict[str, Any],
     character_reference: dict[str, Any] | None,
@@ -261,6 +290,8 @@ def plan_requires_storage(
     for image in plan.get("images") or []:
         role = str(image.get("reference_role") or "")
         if role == "product":
+            return True
+        if role == "effect":
             return True
         if role == "character" and (
             character_reference is None
@@ -551,6 +582,16 @@ def validate_fact_lock_file(
         if not isinstance(identity, dict):
             raise SeedanceError(f"事实锁定记录缺少 {key}。")
         validate_identity(identity, label)
+    conflict_identity = body.get("max_conflict_report")
+    if conflict_identity is not None:
+        if not isinstance(conflict_identity, dict) or not body.get(
+            "max_conflicts_confirmed"
+        ):
+            raise SeedanceError("Max 矛盾报告尚未获得用户确认。")
+        conflict_path = validate_identity(conflict_identity, "Max 矛盾报告")
+        conflict_report = load_json(conflict_path, "Max 矛盾报告")
+        if conflict_report.get("status") != "confirmed":
+            raise SeedanceError("Max 矛盾报告尚未获得用户确认。")
     if assembly_mode == STATIC_OVERRIDE_ASSEMBLY_MODE:
         identity = body.get("static_visual_overrides")
         if not isinstance(identity, dict):
@@ -858,6 +899,8 @@ def compile_prompt(
     motion_reference_type: str = "depth",
     suppress_text_overlays: bool = False,
     strip_dialogue_for_visual_only: bool = False,
+    effect_image_indices: list[int] | None = None,
+    effect_reference_scope: str = "",
 ) -> str:
     if re.search(r"@(?:视频|音频)\d+", body):
         raise SeedanceError("Max 正式稿不得预先包含 @视频N 或 @音频N 引用。")
@@ -915,7 +958,10 @@ def compile_prompt(
         else:
             raise SeedanceError(f"不支持的动作参考类型：{motion_reference_type}")
         if image_count:
-            prefix += "下方每条图片绑定均与@视频1中相同主体标签一一对应。"
+            prefix += (
+                "下方人物与产品图片绑定均与@视频1中相同主体标签一一对应；"
+                "效果参考图只按其独立作用域使用。"
+            )
         else:
             prefix += "未绑定图片的主体外观严格按下方文字定义。"
         if with_character_image and motion_reference_type == "depth":
@@ -930,6 +976,16 @@ def compile_prompt(
                 "全部以绑定人物图片为准。"
             )
         prefixes.append(prefix)
+    effect_indices = effect_image_indices or []
+    if effect_indices:
+        if not effect_reference_scope:
+            raise SeedanceError("效果参考图缺少作用域说明。")
+        joined = "、".join(f"@图片{index}" for index in effect_indices)
+        prefixes.append(
+            f"{joined}是匿名化视觉效果参考图；{effect_reference_scope}。"
+            "这些图片不定义任何人物身份、五官、脸型、发型、表情、姿态、"
+            "动作、构图或背景；不采用其中的马赛克、裁切方式或匿名化痕迹。"
+        )
     if with_reference_audio:
         prefixes.append(
             "@音频1只作为全片人物口播的统一音色参考，仅参考人声音色、"
@@ -971,6 +1027,22 @@ def prepare(args: argparse.Namespace) -> Path:
         require_file(path, f"第 {index} 张产品图")
         for index, path in enumerate(args.product_image, start=1)
     ]
+    effect_images = [
+        require_file(path, f"第 {index} 张效果参考图")
+        for index, path in enumerate(getattr(args, "effect_image", []), start=1)
+    ]
+    effect_reference_scope = str(
+        getattr(args, "effect_reference_scope", "") or ""
+    ).strip()
+    if effect_images and not effect_reference_scope:
+        raise SeedanceError("提供效果参考图时必须指定 --effect-reference-scope。")
+    if effect_reference_scope and not effect_images:
+        raise SeedanceError("--effect-reference-scope 必须与 --effect-image 一起使用。")
+    if (
+        len(effect_reference_scope) > 500
+        or any(character in effect_reference_scope for character in "@{}\r\n")
+    ):
+        raise SeedanceError("效果参考图作用域无效或超过 500 字。")
     transcript_file = (
         require_file(args.transcript_file, "音轨转写文件")
         if args.transcript_file
@@ -989,7 +1061,11 @@ def prepare(args: argparse.Namespace) -> Path:
         if bool(getattr(args, "confirm_voice_rights", False)):
             raise SeedanceError("--confirm-voice-rights 必须与 --reference-audio 一起使用。")
         audio_metadata = None
-    images = ([character_image] if character_image else []) + product_images
+    images = (
+        ([character_image] if character_image else [])
+        + product_images
+        + effect_images
+    )
 
     segment_plan = load_json(plan_path, "分段计划")
     segments = validate_segment_plan(segment_plan)
@@ -1055,15 +1131,21 @@ def prepare(args: argparse.Namespace) -> Path:
         raise SeedanceError(f"--seed 必须在 -1 到 {MAX_SEED} 之间。")
 
     image_assets: list[dict[str, Any]] = []
+    character_count = int(character_image is not None)
+    effect_start = character_count + len(product_images) + 1
     for index, image in enumerate(images, start=1):
+        if character_image and index == 1:
+            reference_role = "character"
+        elif index >= effect_start:
+            reference_role = "effect"
+        else:
+            reference_role = "product"
         image_assets.append(
             {
                 "id": f"image-{index:02d}",
                 "index": index,
                 "kind": "image",
-                "reference_role": (
-                    "character" if character_image and index == 1 else "product"
-                ),
+                "reference_role": reference_role,
                 "identity": file_identity(image),
             }
         )
@@ -1085,6 +1167,8 @@ def prepare(args: argparse.Namespace) -> Path:
             motion_reference_type,
             bool(getattr(args, "suppress_text_overlays", False)),
             strip_dialogue_for_visual_only,
+            list(range(effect_start, effect_start + len(effect_images))),
+            effect_reference_scope,
         )
         prompt_file = prompts_dir / f"part_{index:02d}.txt"
         prompt_file.write_text(compiled.rstrip() + "\n", encoding="utf-8")
@@ -1144,6 +1228,21 @@ def prepare(args: argparse.Namespace) -> Path:
                 ),
             }
             if character_image
+            else None
+        ),
+        "effect_reference": (
+            {
+                "image_ids": [
+                    f"image-{index:02d}"
+                    for index in range(
+                        effect_start,
+                        effect_start + len(effect_images),
+                    )
+                ],
+                "scope": effect_reference_scope,
+                "identity_excluded": True,
+            }
+            if effect_images
             else None
         ),
         "parameters": {
@@ -2119,6 +2218,7 @@ def submit(
     if plan.get("status") != "prepared":
         raise SeedanceError("Seedance 计划状态无效。")
     character_reference = validate_character_reference_plan(plan)
+    validate_effect_reference_plan(plan)
     validate_identity(plan["source_video"], "原始参考视频")
     prompt_path = validate_identity(plan["prompt"], "最终提示词")
     segment_plan_path = validate_identity(plan["segment_plan"], "分段计划")

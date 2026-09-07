@@ -137,6 +137,8 @@ class VerifiedPromptTests(unittest.TestCase):
             / "prompts/video_reverse_max_verify_appearance_system.txt",
             omni_facts_output=root / "omni_facts.json",
             omni_facts_file=None,
+            omni_conflicts_output=root / "omni_conflicts.json",
+            omni_conflicts_file=None,
             omni_metadata_output=root / "omni_meta.json",
             omni_metadata_file=None,
             draft_output=root / "prompt_draft.txt",
@@ -145,6 +147,8 @@ class VerifiedPromptTests(unittest.TestCase):
             output=root / "prompt.txt",
             segment_plan_output=root / "segment_plan.json",
             fact_lock_output=root / "fact_lock.json",
+            max_conflict_report_output=root / "max_conflict_report.json",
+            confirm_max_conflicts=False,
             omni_request_body_output=None,
             omni_response_body_output=None,
             max_request_body_output=None,
@@ -290,9 +294,71 @@ class VerifiedPromptTests(unittest.TestCase):
         )
         self.assertIn("无对白", removed[(1, 1)])
 
+    def test_omni_audio_conflict_is_delegated_to_max(self) -> None:
+        raw_audio = (
+            "<女顾客>（画内、口型同步）说：第一句。"
+            "音效：瓶身摇晃声。"
+        )
+        with self.assertRaisesRegex(MODULE.ScriptError, r"没有使用 \{\}"):
+            MODULE.validate_facts(self.speech_facts(raw_audio), 10, 15)
+
+        omni, conflicts = MODULE.validate_facts_for_max_arbitration(
+            self.speech_facts(raw_audio),
+            10,
+            15,
+        )
+        self.assertEqual(conflicts[0]["path"], "segments[0].shots[0].audio")
+        self.assertTrue(any(item["path"] == "no_speech_confirmed" for item in conflicts))
+
+        corrected_audio = (
+            "<女顾客>（画内、口型同步）说：{第一句}。"
+            "音效：瓶身摇晃声。"
+        )
+        verified = MODULE.validate_facts(
+            self.speech_facts(corrected_audio),
+            10,
+            15,
+        )
+        differences = MODULE.visual_differences(omni, verified, 10.0)
+        path = "segments[0].shots[0].audio"
+        before, after, allowed = differences[path]
+        body = {
+            "fact_review": {
+                "status": "corrected",
+                "corrections": [
+                    {
+                        "path": path,
+                        "omni_value": before,
+                        "corrected_value": after,
+                        "evidence_times": [allowed[0], allowed[1]],
+                        "evidence_description": "原片口播与 transcript 均可核验",
+                    }
+                ],
+            },
+            "verified_source_facts": verified,
+            "appearance_bindings": [
+                {"label": "<女顾客>", "image_refs": [1]},
+                {"label": "<男发型师>", "image_refs": []},
+            ],
+            "audio_overrides": [],
+        }
+        result = MODULE.validate_max_result(
+            body,
+            omni,
+            10,
+            15,
+            True,
+            0,
+            False,
+            10.0,
+        )
+        self.assertEqual(result[0]["segments"][0]["shots"][0]["audio"], corrected_audio)
+        self.assertEqual(result[3][0]["path"], path)
+
     def test_max_context_declares_aggregate_correction_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self.make_args(Path(temporary))
+            args.user_idea = "自然提亮并保留皮肤纹理，效果持续到结尾"
             messages = MODULE.build_max_messages(
                 args,
                 "system",
@@ -305,6 +371,7 @@ class VerifiedPromptTests(unittest.TestCase):
             context_text = messages[1]["content"][-1]["text"]
             context = json.loads(context_text.split("：\n", 1)[1])
             contract = context["correction_path_contract"]
+            self.assertEqual(context["user_idea"], args.user_idea)
 
             self.assertEqual(
                 contract["shot_plan"]["path"],
@@ -325,6 +392,18 @@ class VerifiedPromptTests(unittest.TestCase):
             self.assertNotIn(
                 "audio",
                 contract["shot_visuals"]["value_fields"],
+            )
+            self.assertEqual(
+                contract["shot_audio"]["path"],
+                "segments[i].shots[j].audio",
+            )
+            self.assertEqual(
+                contract["audio_plan"]["path"],
+                "segments[i].audio_plan",
+            )
+            self.assertEqual(
+                contract["no_speech_confirmed"]["path"],
+                "no_speech_confirmed",
             )
             timeline = context["timeline_contract"]
             self.assertEqual(timeline["time_type"], "JSON整数")
@@ -474,7 +553,7 @@ class VerifiedPromptTests(unittest.TestCase):
         corrections = MODULE.validate_corrections(review, differences)
         self.assertEqual(len(corrections), 2)
 
-    def test_unexplained_fact_change_is_rejected(self) -> None:
+    def test_unexplained_fact_change_is_derived_for_user_confirmation(self) -> None:
         omni = MODULE.validate_facts(self.facts(), 10, 15)
         verified = MODULE.validate_facts(self.facts(camera="固定机位"), 10, 15)
         body = {
@@ -483,8 +562,39 @@ class VerifiedPromptTests(unittest.TestCase):
             "appearance_bindings": [{"label": "<模特>", "image_refs": []}],
             "audio_overrides": [],
         }
-        with self.assertRaisesRegex(MODULE.ScriptError, "未逐项解释"):
-            MODULE.validate_max_result(body, omni, 10, 15, False, 0, False, 10.0)
+        result = MODULE.validate_max_result(
+            body,
+            omni,
+            10,
+            15,
+            False,
+            0,
+            False,
+            10.0,
+        )
+        self.assertEqual(len(result[3]), 1)
+        self.assertEqual(
+            result[3][0]["path"],
+            "segments[0].shots[0].camera",
+        )
+        self.assertIn("程序按对应原片允许采样点", result[3][0]["evidence_description"])
+        self.assertEqual(result[3][0]["evidence_times"], [0.0, 5.0, 10.0])
+
+        self.assertEqual(
+            MODULE.select_derived_evidence_times(
+                "segments[0].shots[0].beat_plan",
+                [
+                    {"index": 1, "start_seconds": 0, "end_seconds": 4},
+                    {"index": 2, "start_seconds": 4, "end_seconds": 10},
+                ],
+                [
+                    {"index": 1, "start_seconds": 0, "end_seconds": 5},
+                    {"index": 2, "start_seconds": 5, "end_seconds": 10},
+                ],
+                (0.0, 2.0, 4.0, 5.0, 7.5, 10.0),
+            ),
+            [4.0, 5.0],
+        )
 
     def test_free_text_appearance_and_wrong_image_role_are_rejected(self) -> None:
         facts = MODULE.validate_facts(self.facts(camera="固定机位"), 10, 15)
@@ -721,11 +831,52 @@ class VerifiedPromptTests(unittest.TestCase):
             ):
                 code = MODULE.main()
 
-            self.assertEqual(code, 0)
+            self.assertEqual(code, MODULE.MAX_CONFLICT_CONFIRMATION_REQUIRED)
             omni_mock.assert_called_once()
             max_mock.assert_called_once()
             max_payload = max_mock.call_args.args[2]
             self.assertEqual(max_payload["messages"][1]["content"][0]["type"], "video_url")
+            self.assertFalse(args.output.is_file())
+            pending_report = json.loads(
+                args.max_conflict_report_output.read_text(encoding="utf-8")
+            )
+            self.assertEqual(pending_report["status"], "pending_user_confirmation")
+            self.assertTrue(pending_report["max_corrections"])
+
+            args.overwrite = True
+            args.reuse_candidate = True
+            args.confirm_max_conflicts = True
+            args.omni_facts_file = args.omni_facts_output
+            args.omni_metadata_file = args.omni_metadata_output
+            args.omni_conflicts_file = args.omni_conflicts_output
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=args),
+                mock.patch.object(
+                    MODULE,
+                    "probe_video",
+                    return_value={
+                        "duration_seconds": 10,
+                        "source_duration": 10.0,
+                        "has_audio": False,
+                    },
+                ),
+                mock.patch.object(MODULE, "validate_video_api_limits"),
+                mock.patch.object(MODULE, "validate_image_api_limits"),
+                mock.patch.object(MODULE, "MediaResolver", FakeResolver),
+                mock.patch.object(
+                    MODULE,
+                    "call_omni",
+                    side_effect=AssertionError("确认矛盾时不应重复调用 Omni"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "call_qwen",
+                    side_effect=AssertionError("确认矛盾时不应重复调用 Max"),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(MODULE.main(), 0)
+
             prompt = args.output.read_text(encoding="utf-8")
             self.assertIn("@图片1是<模特>的静态外观参考", prompt)
             self.assertIn("生成目标：", prompt)
@@ -734,6 +885,12 @@ class VerifiedPromptTests(unittest.TestCase):
             self.assertIn("仅轻微眨眼", prompt)
             self.assertNotIn("平稳横移", prompt)
             self.assertNotIn("抬手摸脸", prompt)
+            confirmed_report = json.loads(
+                args.max_conflict_report_output.read_text(encoding="utf-8")
+            )
+            self.assertEqual(confirmed_report["status"], "confirmed")
+            lock = json.loads(args.fact_lock_output.read_text(encoding="utf-8"))
+            self.assertTrue(lock["max_conflicts_confirmed"])
 
     def test_main_reuses_valid_saved_max_candidate_without_api_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -741,26 +898,12 @@ class VerifiedPromptTests(unittest.TestCase):
             args = self.make_args(root)
             args.reuse_candidate = True
             args.overwrite = True
-            omni = MODULE.validate_facts(self.facts(), 10, 15)
-            verified = MODULE.validate_facts(
-                self.facts(camera="固定机位", action="人物正对镜头，仅轻微眨眼"),
-                10,
-                15,
-            )
-            differences = MODULE.visual_differences(omni, verified, 10.0)
+            omni = MODULE.validate_facts(self.facts(camera="固定机位"), 10, 15)
+            verified = deepcopy(omni)
             max_result = {
                 "fact_review": {
-                    "status": "corrected",
-                    "corrections": [
-                        {
-                            "path": path,
-                            "omni_value": before,
-                            "corrected_value": after,
-                            "evidence_times": [interval[0], interval[1]],
-                            "evidence_description": "原片对应时间点可见",
-                        }
-                        for path, (before, after, interval) in differences.items()
-                    ],
+                    "status": "unchanged",
+                    "corrections": [],
                 },
                 "verified_source_facts": verified,
                 "appearance_bindings": [{"label": "<模特>", "image_refs": [1]}],

@@ -273,6 +273,52 @@ class SeedancePipelineTests(unittest.TestCase):
         self.assertIn("白模不负责人物身份、脸型、五官、发型轮廓", compiled)
         self.assertIn("这些信息与白模几何冲突时，以绑定人物图片为准", compiled)
 
+    def test_effect_reference_has_independent_non_identity_scope(self) -> None:
+        compiled = MODULE.compile_prompt(
+            "镜头1[00:00-00:10] 人物展示自然提亮后的半脸肤色。",
+            1,
+            False,
+            effect_image_indices=[1],
+            effect_reference_scope="只参考左右半脸的相对明度、暖色底和皮肤纹理",
+        )
+
+        self.assertIn("@图片1是匿名化视觉效果参考图", compiled)
+        self.assertIn("只参考左右半脸的相对明度、暖色底和皮肤纹理", compiled)
+        self.assertIn("不定义任何人物身份、五官、脸型、发型", compiled)
+        self.assertIn("不采用其中的马赛克", compiled)
+
+    def test_prepare_records_effect_reference_role_and_scope(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "镜头1[00:00-00:10] 人物展示自然提亮后的半脸肤色。\n",
+                encoding="utf-8",
+            )
+            effect = root / "effect.png"
+            Image.new("RGB", (720, 720), "peachpuff").save(effect)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.effect_image = [effect]
+            args.effect_reference_scope = "只参考左右半脸肤色明度与暖色底"
+
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(body["images"][0]["reference_role"], "effect")
+            self.assertEqual(
+                body["effect_reference"],
+                {
+                    "image_ids": ["image-01"],
+                    "scope": args.effect_reference_scope,
+                    "identity_excluded": True,
+                },
+            )
+            self.assertIsNotNone(MODULE.validate_effect_reference_plan(body))
+            self.assertTrue(MODULE.plan_requires_storage(body, None))
+
     def test_prepare_virtual_character_records_private_asset_contract(self) -> None:
         from PIL import Image
 
@@ -1797,6 +1843,38 @@ class SeedancePipelineTests(unittest.TestCase):
             self.assertEqual(
                 validated["assembly_mode"], MODULE.STATIC_OVERRIDE_ASSEMBLY_MODE
             )
+
+    def test_fact_lock_requires_confirmed_max_conflict_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            report = root / "max_conflict_report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pending_user_confirmation",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lock = json.loads(args.fact_lock.read_text(encoding="utf-8"))
+            lock["max_conflict_report"] = MODULE.file_identity(report)
+            lock["max_conflicts_confirmed"] = True
+            args.fact_lock.write_text(json.dumps(lock), encoding="utf-8")
+
+            with self.assertRaisesRegex(MODULE.SeedanceError, "尚未获得用户确认"):
+                MODULE.validate_fact_lock_file(args.fact_lock, prompt, plan)
+
+            report.write_text(
+                json.dumps({"schema_version": 1, "status": "confirmed"}),
+                encoding="utf-8",
+            )
+            lock["max_conflict_report"] = MODULE.file_identity(report)
+            args.fact_lock.write_text(json.dumps(lock), encoding="utf-8")
+            validated = MODULE.validate_fact_lock_file(args.fact_lock, prompt, plan)
+            self.assertTrue(validated["max_conflicts_confirmed"])
 
     def test_static_visual_overrides_reject_action_fields(self) -> None:
         with self.assertRaisesRegex(MODULE.SeedanceError, "镜头字段越权"):

@@ -86,6 +86,18 @@ class ResumePipelineTests(unittest.TestCase):
     def command_value(command: list[str], option: str) -> Path:
         return Path(command[command.index(option) + 1])
 
+    def test_manifest_backfills_empty_effect_reference_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "run_manifest.json"
+            legacy = {"schema_version": 2, "scope": "depth-prompt-seedance"}
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            expected = {
+                **legacy,
+                "effect_images": [],
+                "effect_reference_scope": "",
+            }
+            MODULE.validate_manifest(path, expected)
+
     def test_over_limit_analysis_video_is_rejected_before_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             video = Path(temporary) / "source video.mp4"
@@ -342,6 +354,7 @@ class ResumePipelineTests(unittest.TestCase):
                 root / "output",
                 character,
                 [],
+                [],
                 None,
                 False,
             )
@@ -349,6 +362,38 @@ class ResumePipelineTests(unittest.TestCase):
             self.assertIn("--character-image-type", command)
             self.assertIn("virtual", command)
             self.assertIn("--confirm-virtual-portrait-rights", command)
+
+    def test_effect_reference_is_forwarded_to_seedance_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "input.mp4"
+            prompt = root / "prompt.txt"
+            plan = root / "segment_plan.json"
+            fact_lock = root / "fact_lock.json"
+            effect = root / "effect.png"
+            for path in (video, prompt, plan, fact_lock, effect):
+                path.write_bytes(b"data")
+            args = self.make_args(root, video)
+            args.effect_reference_scope = "只参考左右半脸肤色明度与暖色底"
+
+            command = MODULE.build_seedance_prepare_command(
+                args,
+                video,
+                prompt,
+                plan,
+                fact_lock,
+                root / "output",
+                None,
+                [],
+                [effect],
+                None,
+                False,
+            )
+
+            self.assertIn("--effect-image", command)
+            self.assertIn(str(effect), command)
+            self.assertIn("--effect-reference-scope", command)
+            self.assertIn(args.effect_reference_scope, command)
 
     def test_resume_reuses_draft_and_depth_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -535,6 +580,58 @@ class ResumePipelineTests(unittest.TestCase):
             self.assertTrue(
                 (args.output_dir / "depth/input_depth_720p_part_01.mp4").is_file()
             )
+
+    def test_max_conflict_confirmation_is_an_expected_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "input.mp4"
+            video.write_bytes(b"video")
+            args = self.make_args(root, video)
+            args.scope = "prompt-seedance"
+
+            def fake_popen(command: list[str]):
+                self.assertIn(str(MODULE.QWEN_SCRIPT), command)
+
+                def write_conflict_report():
+                    report = self.command_value(
+                        command, "--max-conflict-report-output"
+                    )
+                    report.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "status": "pending_user_confirmation",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                return FakeProcess(
+                    MODULE.MAX_CONFLICT_CONFIRMATION_REQUIRED,
+                    write_conflict_report,
+                )
+
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=args),
+                mock.patch.object(MODULE, "validate_analysis_video"),
+                mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(
+                    MODULE,
+                    "run_process",
+                    side_effect=AssertionError("等待矛盾确认时不应准备 Seedance"),
+                ),
+                mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "sk-test-value"}),
+            ):
+                self.assertEqual(MODULE.main(), 0)
+
+            state = json.loads(
+                (
+                    args.output_dir
+                    / "awaiting_max_conflict_confirmation.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "awaiting_user_confirmation")
+            self.assertFalse((args.output_dir / "ready_for_seedance.json").exists())
 
     def test_prompt_seedance_mode_never_resolves_or_runs_depth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
