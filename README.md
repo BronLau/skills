@@ -29,6 +29,22 @@
 使用 $cl-write-prd，根据当前会话中已经确认的原型和需求，为这个飞书文档编写需求文档：<飞书文档链接>
 ```
 
+### ai-character-cards
+
+根据人物参考图片提炼可编辑特征，统筹设计有面容差异的原创写实人物，使用 Codex 内置生图批量生成四视图角色卡。
+
+核心流程：
+
+1. 综合参考图，按 8 项结构提炼面部特征，确认修改项和生成数量；
+2. 规划每个人的面部比例、主要辨识点及五官配合，再补齐妆造；
+3. 分角色文生图，检查面孔差异与四视图一致性，交付原图、角色资料、实际提示词和本地预览。
+
+调用示例：
+
+```text
+使用 $ai-character-cards，分析我上传的人物图片，确认特征和数量后生成一批有面容差异的写实四视图角色卡。
+```
+
 ### v2role-card
 
 从上传的视频中识别主要人物、抽取关键帧和分析视觉风格，并为用户确认后的每个角色生成一张与源视频风格一致的 16:9 四视图角色卡。
@@ -94,6 +110,7 @@
 ```bash
 mkdir -p ~/.codex/skills
 ln -s /absolute/path/to/skills/cl-write-prd ~/.codex/skills/cl-write-prd
+ln -s /absolute/path/to/skills/ai-character-cards ~/.codex/skills/ai-character-cards
 ln -s /absolute/path/to/skills/v2role-card ~/.codex/skills/v2role-card
 ln -s /absolute/path/to/skills/video-reverse-replicate-product ~/.codex/skills/video-reverse-replicate-product
 ln -s /absolute/path/to/skills/video-white-model-prompt ~/.codex/skills/video-white-model-prompt

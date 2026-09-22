@@ -1,0 +1,4 @@
+interface:
+  display_name: "批量创建 AI 角色卡"
+  short_description: "提炼人物特征并规划差异化面容，用 Codex 内置生图批量生成写实四视图角色卡"
+  default_prompt: "使用 $ai-character-cards，分析我上传的人物图片，先给出可编辑特征并确认生成数量，再生成有面容差异的写实四视图角色卡。"
