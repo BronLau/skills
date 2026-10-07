@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-使用阿里云百炼 Qwen3.5-Omni-Plus 与 Qwen3.8-Max 两阶段反推视频生成提示词。
+使用阿里云百炼 Qwen3.8-Omni-Flash 与 Qwen3.8-Max 两阶段反推视频生成提示词。
 
 参考视频必须通过 --video 显式传入，原视频始终只读。
 系统提示词从独立文本文件读取，并作为 system message 原样提交。
@@ -10,7 +10,7 @@
   DASHSCOPE_API_KEY   可选，阿里云百炼 API Key；也可传 --api-key-file
   DASHSCOPE_BASE_URL  可选，OpenAI 兼容接口根地址
   QWEN_MODEL          可选，默认 qwen3.8-max
-  QWEN_OMNI_MODEL     可选，默认 qwen3.5-omni-plus
+  QWEN_OMNI_MODEL     可选，默认 qwen3.8-omni-flash
 
 示例：
   export DASHSCOPE_API_KEY="sk-..."
@@ -57,6 +57,9 @@ from media_preflight import (
 )
 
 
+from video_prompt_format import is_public_prompt, validate_body as validate_public_body
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SYSTEM_PROMPT = (
     SCRIPT_DIR.parent / "prompts" / "video_reverse_system_prompt.txt"
@@ -69,7 +72,7 @@ DEFAULT_MAX_REFINE_ADDENDUM = (
 )
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.8-max"
-DEFAULT_OMNI_MODEL = "qwen3.5-omni-plus"
+DEFAULT_OMNI_MODEL = "qwen3.8-omni-flash"
 RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 DEFAULT_MAX_INLINE_REQUEST_MB = DEFAULT_INLINE_LIMIT_MB
 DEFAULT_MAX_TOKENS = 32768
@@ -122,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--omni-draft-addendum",
         type=Path,
         default=DEFAULT_OMNI_DRAFT_ADDENDUM,
-        help="Qwen3.5-Omni-Plus 初稿阶段附加提示词。",
+        help="Qwen3.8-Omni-Flash 初稿阶段附加提示词。",
     )
     parser.add_argument(
         "--max-refine-addendum",
@@ -211,7 +214,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--draft-output",
         type=Path,
-        help="可选：保存 Qwen3.5-Omni-Plus 视听提示词初稿。",
+        help="可选：保存 Qwen3.8-Omni-Flash 视听提示词初稿。",
     )
     parser.add_argument(
         "--draft-file",
@@ -437,7 +440,7 @@ def validate_video_api_limits(path: Path, metadata: dict[str, Any]) -> None:
             f"Seedance 成片要求参考视频至少 {MIN_SEGMENT_SECONDS} 秒。"
         )
     if metadata["has_audio"] and duration > 3600:
-        raise ScriptError("含音轨视频超过 Qwen3.5-Omni-Plus 的 1 小时时长上限。")
+        raise ScriptError("含音轨视频超过当前分析链路的 1 小时时长上限。")
     if not metadata["has_audio"] and duration > 7200:
         raise ScriptError("视频超过 Qwen3.8-Max 的 2 小时时长上限。")
 
@@ -886,6 +889,12 @@ def parse_timecode(value: str) -> float:
 
 
 def validate_shot_timeline(section: str, duration: float, label: str) -> None:
+    if is_public_prompt(section):
+        try:
+            validate_public_body(section, duration)
+        except ValueError as exc:
+            raise ScriptError(f"{label}：{exc}") from exc
+        return
     matches = list(SHOT_PATTERN.finditer(section))
     if not matches:
         raise ScriptError(f"{label}没有可解析的镜头时间轴。")
@@ -1137,6 +1146,8 @@ def validate_no_api_control_literals(result: str, label: str) -> None:
 
 def validate_no_segment_overview(result: str, label: str) -> None:
     for index, section in enumerate(prompt_sections(result), start=1):
+        if is_public_prompt(section):
+            continue
         first_shot = SHOT_PATTERN.search(section)
         if first_shot is None:
             continue
@@ -1363,6 +1374,7 @@ def validate_prompt_contract(
     expected_image_count: int,
     label: str,
     locked_plan: dict[str, Any] | None = None,
+    facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plan = build_segment_plan(
         result,
@@ -1370,6 +1382,23 @@ def validate_prompt_contract(
         source_duration_seconds,
         segment_max_seconds,
     )
+    if facts is not None:
+        sections = prompt_sections(result)
+        if len(sections) != len(facts["segments"]):
+            raise ScriptError("正文分段与锁定事实不一致。")
+        for section, segment in zip(sections, facts["segments"]):
+            if is_public_prompt(section):
+                try:
+                    validate_public_body(section, segment["duration_seconds"], segment)
+                except ValueError as exc:
+                    raise ScriptError(str(exc)) from exc
+        if facts["schema_version"] >= 3:
+            plan["shot_timelines"] = [
+                {"segment_index": segment["index"], "shots": [
+                    {key: shot[key] for key in ("index", "start_seconds", "end_seconds")}
+                    for shot in segment["shots"]
+                ]} for segment in facts["segments"]
+            ]
     validate_image_reference_contract(result, expected_image_count, label)
     validate_no_api_control_literals(result, label)
     validate_no_segment_overview(result, label)
@@ -1451,7 +1480,7 @@ def call_omni(
         from openai import OpenAI
     except ImportError as exc:
         raise ScriptError(
-            "含音轨视频需要 openai Python SDK 以调用 Qwen3.5-Omni-Plus"
+            "含音轨视频需要 openai Python SDK 以调用 Qwen3.8-Omni-Flash"
         ) from exc
 
     client = OpenAI(
@@ -1537,7 +1566,7 @@ def call_omni(
         )
         return result, response_record
 
-    raise ScriptError(f"Qwen3.5-Omni-Plus 调用失败：{last_error}")
+    raise ScriptError(f"Qwen3.8-Omni-Flash 调用失败：{last_error}")
 
 
 def call_qwen(
@@ -1980,7 +2009,7 @@ def main() -> int:
             )
             require_complete_finish(
                 str(omni_response.get("finish_reason") or ""),
-                "Qwen3.5-Omni-Plus 初稿",
+                "Qwen3.8-Omni-Flash 初稿",
             )
             try:
                 draft_plan, draft_structure_error = validate_omni_draft_for_max(
@@ -2018,7 +2047,7 @@ def main() -> int:
                 )
                 require_complete_finish(
                     str(omni_response.get("finish_reason") or ""),
-                    "Qwen3.5-Omni-Plus 初稿修复",
+                    "Qwen3.8-Omni-Flash 初稿修复",
                 )
                 write_text_output(
                     draft_candidate_destination,

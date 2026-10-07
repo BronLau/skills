@@ -226,6 +226,7 @@ def main() -> int:
         audio_override_map(verification.get("audio_overrides")),
     )
     write_text_output(prompt_path, prompt, True, "静态视觉覆盖正式提示词")
+    lock["prompt_format"] = "public_v1"
     lock["assembly_mode"] = STATIC_OVERRIDE_ASSEMBLY_MODE
     lock["prompt_sha256"] = prompt_text_sha256(prompt_path)
     lock["static_visual_overrides"] = file_identity(overrides_path)

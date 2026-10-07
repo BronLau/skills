@@ -130,7 +130,7 @@ class VerifiedPromptTests(unittest.TestCase):
             api_key_file=None,
             base_url="https://example.invalid/v1",
             model="qwen3.8-max",
-            omni_model="qwen3.5-omni-plus",
+            omni_model="qwen3.8-omni-flash",
             fps=4.0,
             omni_system_prompt=SKILL_DIR / "prompts/video_reverse_omni_facts_system.txt",
             max_system_prompt=SKILL_DIR
@@ -219,9 +219,9 @@ class VerifiedPromptTests(unittest.TestCase):
             {},
         )
         self.assertEqual(facts["schema_version"], 2)
-        self.assertIn("<女顾客>（画内、口型同步）说：{第一句}", prompt)
-        self.assertIn("<男发型师>自然闭口聆听", prompt)
-        self.assertIn("音效：瓶身摇晃声", prompt)
+        self.assertIn("女顾客（画内、口型同步）说：{第一句}", prompt)
+        self.assertIn("男发型师自然闭口聆听", prompt)
+        self.assertIn("<瓶身摇晃声>", prompt)
 
         invalid_audio = (
             ("{第一句} {第二句}", "每句.*说话人"),
@@ -436,12 +436,12 @@ class VerifiedPromptTests(unittest.TestCase):
             {},
         )
 
-        self.assertIn("生成目标：", prompt)
-        self.assertIn("镜头1[00:00-00:10]", prompt)
-        self.assertIn("动作阶段1[00:00-00:04]", prompt)
-        self.assertIn("动作阶段2[00:04-00:10]", prompt)
-        self.assertEqual(prompt.count("镜头1["), 1)
-        self.assertIn("全片约束：", prompt)
+        self.assertIn("整体视听设定：", prompt)
+        self.assertIn("镜头1｜00:00 - 00:10", prompt)
+        self.assertIn("00:00 - 00:04，模特平静看向前方", prompt)
+        self.assertIn("00:04 - 00:10，模特短暂睁大眼睛", prompt)
+        self.assertEqual(prompt.count("镜头1｜"), 1)
+        self.assertIn("全片不生成字幕", prompt)
 
         broken = deepcopy(body)
         broken["segments"][0]["shots"][0]["beats"][1]["start_seconds"] = 5
@@ -878,9 +878,9 @@ class VerifiedPromptTests(unittest.TestCase):
                 self.assertEqual(MODULE.main(), 0)
 
             prompt = args.output.read_text(encoding="utf-8")
-            self.assertIn("@图片1是<模特>的静态外观参考", prompt)
-            self.assertIn("生成目标：", prompt)
-            self.assertIn("动作阶段1[00:00-00:10]", prompt)
+            self.assertIn("@图片1是模特的静态外观参考", prompt)
+            self.assertIn("整体视听设定：", prompt)
+            self.assertIn("镜头1｜00:00 - 00:10", prompt)
             self.assertIn("固定机位", prompt)
             self.assertIn("仅轻微眨眼", prompt)
             self.assertNotIn("平稳横移", prompt)

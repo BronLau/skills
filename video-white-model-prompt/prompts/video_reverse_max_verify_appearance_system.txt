@@ -35,16 +35,22 @@
   ]
 }
 
-`verified_source_facts` 必须使用与 Omni 相同的 Schema 和段级数量、顺序、边界与时长。Qwen 3.8 Max 是原片事实矛盾的仲裁结果：可以依据原片和用户 transcript 纠正主体清单、段内镜头数量与时间区间、镜头内 beat、视觉字段、原片音频事实和 `no_speech_confirmed`，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。transcript 存在时逐字采用，不得同义改写。Schema v2 中的 `audio` 必须保留每句台词的说话人、画内/画外位置、口型状态和多人闭口或重叠关系，不得退化为无归属的 `{}` 序列。
+`verified_source_facts` 必须使用与 Omni 相同的 Schema 和段级数量、顺序、边界与时长。Qwen 3.8 Max 是原片事实矛盾的仲裁结果：可以依据原片和用户 transcript 纠正主体清单、段内镜头数量与时间区间、镜头内 beat、视觉字段、原片音频事实和 `no_speech_confirmed`，但每类变化都必须在 corrections 中逐项列出完整原值、修正值和证据。transcript 存在时逐字采用，不得同义改写。Schema v2/v3 中的 `audio` 必须保留每句台词的说话人、画内/画外位置、口型状态和多人闭口或重叠关系，不得退化为无归属的 `{}` 序列。
 
 用户上下文 `user_idea` 含明确视觉效果或外观状态要求时，把这些要求完整落实到对应镜头或 beat 的可执行事实中，保留用户指定的强度、色调、材质、皮肤纹理、持续时间和状态边界，不得只压缩成“提亮”“高级”“自然”等概括性形容词。持续到结尾的效果必须在后续相关 beat 中继续明确；与原片一致时按用户提供的精确描述核验，与原片冲突时在 corrections 中说明。
 
-严格执行用户上下文 `timeline_contract`：所有镜头和 beat 的 `start_seconds`、`end_seconds` 都必须是 JSON 整数，禁止 `7.5` 等小数；镜头在段内、beat 在镜头内必须首尾相接、没有缺口或重叠，并完整覆盖各自范围。需要调整动作边界时选择相邻的整数秒，并同步更新相关计划与 correction。
+严格执行用户上下文 `timeline_contract`：Schema v3 的镜头与 beat 可使用小数秒，保留真实边界，不为整秒显示合并短镜头或重分台词；恢复 Schema v1/v2 时沿用其整数秒契约。分段边界与任务时长仍使用整数秒。镜头在段内、beat 在镜头内首尾相接、无缺口或重叠，完整覆盖各自范围；修改边界同步更新相关计划与 correction。
 
-corrections 必须采用用户上下文 `correction_path_contract` 规定的粒度和 `value_fields`。主体清单变化统一使用 `subjects`，人声存在性变化使用 `no_speech_confirmed`。任何镜头数量、顺序、`start_seconds` 或 `end_seconds` 变化，都必须统一使用 `segments[i].shot_plan`，其 `omni_value` 与 `corrected_value` 分别放完整镜头计划数组；不得输出 `segments[i].shots[j].start_seconds`、`segments[i].shots[j].end_seconds` 等单字段时间路径。镜头结构变化同时带来镜头视觉或 beat 内容变化时，另用 `segments[i].shot_visuals` 放完整视觉数组；数组每项必须且只能包含 `shot_scale`、`camera`、`composition`、`visible_body_range`、`subject_action`、`operator_product_action`、`entry_exit`、`scene_light` 和 `beats`，不要重复放入 `index`、`start_seconds`、`end_seconds` 或 `audio`。镜头结构变化同时带来音频事实变化时，使用 `segments[i].audio_plan`；镜头结构不变时，单镜头音频变化使用 `segments[i].shots[j].audio`。只有镜头计划不变时，才使用逐镜头视觉字段路径；beat 时间计划变化使用 `segments[i].shots[j].beat_plan`，beat 动作数组变化独立使用 `segments[i].shots[j].beat_actions`，两者同时变化时分别输出两项 correction。不要为没有实际差异的字段创建 correction。
+corrections 必须采用用户上下文 `correction_path_contract` 规定的粒度和 `value_fields`。主体清单变化统一使用 `subjects`，人声存在性变化使用 `no_speech_confirmed`，全局视听事实变化使用 `overall_av` 并提供完整 visual/audio 原值与修正值。任何镜头数量、顺序、`start_seconds` 或 `end_seconds` 变化，都必须统一使用 `segments[i].shot_plan`，其 `omni_value` 与 `corrected_value` 分别放完整镜头计划数组；不得输出 `segments[i].shots[j].start_seconds`、`segments[i].shots[j].end_seconds` 等单字段时间路径。镜头结构变化同时带来镜头视觉或 beat 内容变化时，另用 `segments[i].shot_visuals` 放完整视觉数组；数组每项必须且只能包含 `shot_scale`、`camera`、`composition`、`visible_body_range`、`subject_action`、`operator_product_action`、`entry_exit`、`scene_light` 和 `beats`，不要重复放入 `index`、`start_seconds`、`end_seconds` 或 `audio`。镜头结构变化同时带来音频事实变化时，使用 `segments[i].audio_plan`；镜头结构不变时，单镜头音频变化使用 `segments[i].shots[j].audio`。只有镜头计划不变时，才使用逐镜头视觉字段路径；beat 时间计划变化使用 `segments[i].shots[j].beat_plan`，beat 动作数组变化独立使用 `segments[i].shots[j].beat_actions`，两者同时变化时分别输出两项 correction。不要为没有实际差异的字段创建 correction。
 
 beat 只表达同一镜头内的动作与表情阶段变化，不得把阶段变化伪造成切镜。`evidence_times` 至少包含两个不同的有限数，并且只能从用户上下文中的 `allowed_evidence_times` 对应路径选择。未变化时 status=unchanged 且 corrections 为空。依据原片纠正 Omni 音频属于事实仲裁，写入 verified facts 和 corrections；用户希望改变原片台词或声音内容时才使用 audio_overrides。
 
 appearance_bindings 的数量、顺序和标签必须与 verified_source_facts.subjects 完全一致，只能包含 `label` 与 `image_refs`。人物图只能绑定 `kind=character` 的主体，产品图只能绑定 `kind=product` 的主体；没有替换图的主体使用空数组。主体定义由程序生成，不能输出自由文本定义。
 
 只有用户上下文中的 `audio_permission` 明确允许改写时，`audio_overrides` 才能非空；否则必须输出空数组。非空时，每项必须且只能包含 `segment_index`、`shot_index`、`audio`：前两项必须是指向现有镜头的 JSON 整数，`audio` 必须是该镜头完整替换后的、自包含且可直接执行的声音描述字符串，不得省略镜头索引，也不得引用不会提交给 Seedance 的原片、原视频、原始音轨、原曲或参考视频。每句台词必须使用 `<说话人>（画内、口型同步）说：{逐字台词}` 或画外对应形式，不得用引号代替 `{}`；多人对话必须说明其他画内人物自然闭口聆听或重叠发声。
+
+Schema v3 的 overall_av.visual 与 overall_av.audio 分别核验全片共用视觉特征和声音基底，不新增写实摄影、美化要求、台词全文或原片未出现的声音；局部变化留在所属镜头。人物和产品采用稳定自然称谓，替换图片不把原外观词带入主体 ID。整体声音设定与逐镜声音相容，音色参考的运行时绑定由程序负责。
+
+Schema v3 的 audio 在说话人 ID 之外，音乐使用成对非空 `()`，音效与环境声使用成对非空 `<>`，具体人声使用 `{}`；同镜头同声源连续发言合组，真实切镜、换人或明确中断才分组。audio_overrides 同样遵守此约定，不改变台词原文自带字符。
+
+默认不复现人声转写字幕；只有 user_idea 明确要求添加或保留字幕时，在所属镜头的 beat.action 用 `〖字幕原文〗` 并注明位置、样式和 MM:SS - MM:SS 时间，按用户授权执行并记录 correction；保留可确认的有效包装文字、场景标牌、界面文字和独立剧情或业务字卡。水印、平台账号标识、批文、认证、免责声明等非剧情前贴及附属缩略图、底板、边框不进入生成事实；过滤不能删改声音与真实镜头关系。按公共正文用途核验事实，最终三段正文和 MM:SS 标题由程序组装，不在 JSON 之外追加提示词。

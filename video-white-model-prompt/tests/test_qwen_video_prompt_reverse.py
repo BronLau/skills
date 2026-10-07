@@ -148,7 +148,7 @@ class PipelinePromptTests(unittest.TestCase):
             api_key_file=None,
             base_url="https://example.invalid/compatible-mode/v1",
             model="qwen3.8-max",
-            omni_model="qwen3.5-omni-plus",
+            omni_model="qwen3.8-omni-flash",
             fps=4.0,
             aspect_ratio=None,
             duration_seconds=None,
@@ -988,7 +988,7 @@ class PipelinePromptTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 [request["model"] for request in FakeDashScopeHandler.requests],
-                ["qwen3.5-omni-plus", "qwen3.8-max"],
+                ["qwen3.8-omni-flash", "qwen3.8-max"],
             )
             self.assertIn("本地 SSE", args.draft_output.read_text(encoding="utf-8"))
             self.assertIn("本地 HTTP", args.output.read_text(encoding="utf-8"))

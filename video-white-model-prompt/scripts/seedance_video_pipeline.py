@@ -35,6 +35,9 @@ from media_preflight import (
     validate_seedance_image_input as validate_seedance_image_input_shared,
 )
 from qwen_video_prompt_reverse import SEGMENT_HEADER_PATTERN
+from video_prompt_format import (
+    is_public_prompt, strip_audio, add_runtime_references, split_sections,
+)
 
 
 MODEL_BY_SEGMENT_MAX_SECONDS = {
@@ -905,7 +908,15 @@ def compile_prompt(
     if re.search(r"@(?:视频|音频)\d+", body):
         raise SeedanceError("Max 正式稿不得预先包含 @视频N 或 @音频N 引用。")
     compiled = re.sub(r"(?<!@)图片(?P<number>\d+)", r"@图片\g<number>", body)
-    if strip_dialogue_for_visual_only:
+    public = is_public_prompt(compiled)
+    if public:
+        try:
+            split_sections(compiled)
+            if strip_dialogue_for_visual_only:
+                compiled = strip_audio(compiled)
+        except ValueError as exc:
+            raise SeedanceError(str(exc)) from exc
+    if strip_dialogue_for_visual_only and not public:
         compiled = re.sub(r"\{[^{}]*\}", "", compiled)
         compiled = re.sub(r"(?m)^\s*声音[:：].*$", "", compiled)
         compiled = re.sub(r"。\s*。", "。", compiled)
@@ -929,6 +940,7 @@ def compile_prompt(
             f"提示词引用了不存在的 @图片{max(indices)}，实际只有 {image_count} 张。"
         )
     prefixes: list[str] = []
+    materials: list[str] = []
     if strip_dialogue_for_visual_only:
         prefixes.append(
             "本任务只生成无声视觉画面，不生成、理解或展示任何台词文本；"
@@ -975,13 +987,13 @@ def compile_prompt(
                 "脸型、五官、发型轮廓、头身比、体型细节、服装或材质；人物静态外观"
                 "全部以绑定人物图片为准。"
             )
-        prefixes.append(prefix)
+        (materials if public else prefixes).append(prefix)
     effect_indices = effect_image_indices or []
     if effect_indices:
         if not effect_reference_scope:
             raise SeedanceError("效果参考图缺少作用域说明。")
         joined = "、".join(f"@图片{index}" for index in effect_indices)
-        prefixes.append(
+        (materials if public else prefixes).append(
             f"{joined}是匿名化视觉效果参考图；{effect_reference_scope}。"
             "这些图片不定义任何人物身份、五官、脸型、发型、表情、姿态、"
             "动作、构图或背景；不采用其中的马赛克、裁切方式或匿名化痕迹。"
@@ -992,6 +1004,8 @@ def compile_prompt(
             "发声质感、语速和韵律；不复用音频1中的原台词、背景音乐或环境声。"
             "所有口播台词严格以各镜头大括号中的文字为准，并始终使用同一音色。"
         )
+    if public:
+        return add_runtime_references(compiled, materials, prefixes)
     return "\n".join([*prefixes, compiled.strip()])
 
 

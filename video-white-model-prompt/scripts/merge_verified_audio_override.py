@@ -143,6 +143,7 @@ def main() -> int:
         int(base_plan["segment_max_seconds"]),
         expected_images,
         "锁定视觉事实与已核验音频覆盖合并终稿",
+        facts=facts,
     )
     if rebuilt_plan != base_plan:
         raise SeedanceError("合并后的提示词改变了分段计划，拒绝写入。")
@@ -169,6 +170,7 @@ def main() -> int:
     atomic_write_json(verification_output, merged_verification)
 
     merged_lock = copy.deepcopy(base_lock)
+    merged_lock["prompt_format"] = "public_v1"
     merged_lock["assembly_mode"] = AUDIO_OVERRIDE_ASSEMBLY_MODE
     merged_lock["prompt_sha256"] = prompt_text_sha256(prompt_output)
     merged_lock["segment_plan_sha256"] = file_sha256(plan_output)

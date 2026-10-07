@@ -40,6 +40,9 @@ from qwen_video_prompt_reverse import (
 )
 
 
+from video_prompt_format import FORMAT_VERSION, render_prompt as render_public_prompt
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_DIR = SCRIPT_DIR.parent / "prompts"
 DEFAULT_OMNI_PROMPT = PROMPT_DIR / "video_reverse_omni_facts_system.txt"
@@ -58,6 +61,11 @@ VISUAL_FIELDS = (
 )
 
 CORRECTION_PATH_CONTRACT = {
+    "overall_av": {
+        "when": "全局视觉风格或声音基底变化",
+        "path": "overall_av",
+        "value_shape": "完整 overall_av 对象，包含 visual 与 audio",
+    },
     "subjects": {
         "when": "主体清单或任一主体静态描述变化",
         "path": "subjects",
@@ -122,15 +130,16 @@ TIMELINE_CONTRACT = {
     "continuity": "镜头连续覆盖完整分段，beats 连续覆盖完整镜头，无缺口或重叠",
     "fractional_seconds_allowed": False,
 }
-QUALITY_CONSTRAINT = (
-    "全片约束：人物、产品与场景外观全程保持一致。"
-    "不要字幕、叠加文字、乱码或平台水印；"
-    "不新增未提供的品牌、包装文字或标识。"
-)
+PUBLIC_TIMELINE_CONTRACT = {
+    **TIMELINE_CONTRACT,
+    "time_type": "有限 JSON 数值，可含小数秒",
+    "fractional_seconds_allowed": True,
+    "display_only": "正文使用 MM:SS - MM:SS 近似显示，不据显示值改变真实镜头边界。",
+}
 UNAVAILABLE_AUDIO_REFERENCE_PATTERN = re.compile(
     r"原片|原视频|原始音轨|原曲|参考视频"
 )
-SUPPORTED_FACT_SCHEMA_VERSIONS = {1, 2}
+SUPPORTED_FACT_SCHEMA_VERSIONS = {1, 2, 3}
 AUDIO_ATTRIBUTION_SCHEMA_VERSION = 2
 DIALOGUE_PATTERN = re.compile(r"\{(?P<text>[^{}\n]+)\}")
 ATTRIBUTED_DIALOGUE_PATTERN = re.compile(
@@ -331,6 +340,18 @@ def integer(value: Any, label: str) -> int:
     return int(rounded)
 
 
+def precise_seconds(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScriptError(f"{label}必须是 JSON 数值。")
+    if not math.isfinite(value) or value < 0:
+        raise ScriptError(f"{label}必须是非负有限秒数。")
+    return value
+
+
+def same_time(left: float, right: float) -> bool:
+    return math.isclose(left, right, rel_tol=0, abs_tol=1e-6)
+
+
 def dialogue_texts(audio: str) -> list[str]:
     return [match.group("text").strip() for match in DIALOGUE_PATTERN.finditer(audio)]
 
@@ -394,11 +415,13 @@ def validate_audio_description(
 
 def normalize_beats(
     value: Any,
-    shot_start: int,
-    shot_end: int,
+    shot_start: float,
+    shot_end: float,
     default_action: str,
     label: str,
+    fractional: bool = False,
 ) -> list[dict[str, Any]]:
+    parse_seconds = precise_seconds if fractional else integer
     if value is None:
         return [
             {
@@ -416,18 +439,18 @@ def normalize_beats(
         if not isinstance(beat, dict):
             raise ScriptError(f"{label} 第 {beat_index} 个 beat 无效。")
         index = integer(beat.get("index"), f"{label} beat index")
-        start = integer(
+        start = parse_seconds(
             beat.get("start_seconds"),
             f"{label} beat start_seconds",
         )
-        end = integer(
+        end = parse_seconds(
             beat.get("end_seconds"),
             f"{label} beat end_seconds",
         )
         action = str(beat.get("action") or "").strip()
         if (
             index != beat_index
-            or start != cursor
+            or not same_time(start, cursor)
             or end <= start
             or not action
             or "{" in action
@@ -443,7 +466,7 @@ def normalize_beats(
             }
         )
         cursor = end
-    if cursor != shot_end:
+    if not same_time(cursor, shot_end):
         raise ScriptError(f"{label} beats 未覆盖完整镜头时长。")
     return normalized
 
@@ -465,8 +488,8 @@ def uses_summary_beat(shot: dict[str, Any]) -> bool:
     return bool(
         isinstance(beats, list)
         and len(beats) == 1
-        and int(beats[0]["start_seconds"]) == int(shot["start_seconds"])
-        and int(beats[0]["end_seconds"]) == int(shot["end_seconds"])
+        and same_time(beats[0]["start_seconds"], shot["start_seconds"])
+        and same_time(beats[0]["end_seconds"], shot["end_seconds"])
         and str(beats[0]["action"]) == default_beat_action(shot)
     )
 
@@ -483,6 +506,17 @@ def validate_facts(
     schema_version = integer(body.get("schema_version", 1), "facts schema_version")
     if schema_version not in SUPPORTED_FACT_SCHEMA_VERSIONS:
         raise ScriptError(f"不支持的结构化事实 Schema：{schema_version}")
+    overall_av = None
+    if schema_version >= 3:
+        overall_av = body.get("overall_av")
+        if not isinstance(overall_av, dict) or set(overall_av) != {"visual", "audio"}:
+            raise ScriptError("Schema v3 缺少 overall_av.visual/audio。")
+        if any(not isinstance(value, str) or "{" in value or "}" in value for value in overall_av.values()):
+            raise ScriptError("overall_av 必须是全局视听描述，不能包含台词全文。")
+        if not overall_av["visual"].strip():
+            raise ScriptError("overall_av.visual 不能为空。")
+        overall_av = {key: value.strip() for key, value in overall_av.items()}
+    parse_seconds = precise_seconds if schema_version >= 3 else integer
     subjects = body.get("subjects")
     segments = body.get("segments")
     if not isinstance(subjects, list) or not subjects:
@@ -533,9 +567,9 @@ def validate_facts(
             if not isinstance(shot, dict):
                 raise ScriptError(f"第 {segment_index} 段镜头无效。")
             index_value = integer(shot.get("index"), "shot index")
-            shot_start = integer(shot.get("start_seconds"), "shot start_seconds")
-            shot_end = integer(shot.get("end_seconds"), "shot end_seconds")
-            if index_value != shot_index or shot_start != shot_cursor or shot_end <= shot_start:
+            shot_start = parse_seconds(shot.get("start_seconds"), "shot start_seconds")
+            shot_end = parse_seconds(shot.get("end_seconds"), "shot end_seconds")
+            if index_value != shot_index or not same_time(shot_start, shot_cursor) or shot_end <= shot_start:
                 raise ScriptError(f"第 {segment_index} 段镜头时间轴不连续。")
             normalized_shot: dict[str, Any] = {
                 "index": index_value,
@@ -555,6 +589,7 @@ def validate_facts(
                 shot_end,
                 default_beat_action(normalized_shot),
                 f"第 {segment_index} 段镜头 {shot_index}",
+                fractional=schema_version >= 3,
             )
             raw_audio = str(shot.get("audio") or "").strip()
             try:
@@ -583,7 +618,7 @@ def validate_facts(
             normalized_shot["audio"] = audio
             normalized_shots.append(normalized_shot)
             shot_cursor = shot_end
-        if shot_cursor != duration:
+        if not same_time(shot_cursor, duration):
             raise ScriptError(f"第 {segment_index} 段镜头未覆盖完整时长。")
         normalized_segments.append(
             {
@@ -616,6 +651,7 @@ def validate_facts(
         )
     return {
         "schema_version": schema_version,
+        **({"overall_av": overall_av} if overall_av is not None else {}),
         "no_speech_confirmed": no_speech,
         "subjects": normalized_subjects,
         "segments": normalized_segments,
@@ -695,6 +731,8 @@ def evidence_time_index(facts: dict[str, Any], source_duration: float) -> dict[s
             evidence_times(0, source_duration, source_duration)
         )
     }
+    if "overall_av" in facts:
+        result["overall_av"] = list(evidence_times(0, source_duration, source_duration))
     for segment_pos, segment in enumerate(facts["segments"]):
         segment_start = float(segment["source_start_seconds"])
         segment_end = float(segment["source_end_seconds"])
@@ -739,6 +777,13 @@ def visual_differences(
     if segment_structure(omni) != segment_structure(verified):
         raise ScriptError("Max 不得修改段级数量、顺序、边界或时长。")
     differences: dict[str, tuple[Any, Any, tuple[float, ...]]] = {}
+    if omni["schema_version"] != verified["schema_version"]:
+        raise ScriptError("Max 不得改变事实 Schema 版本。")
+    if omni.get("overall_av") != verified.get("overall_av"):
+        differences["overall_av"] = (
+            omni.get("overall_av"), verified.get("overall_av"),
+            evidence_times(0, source_duration, source_duration),
+        )
     if omni["subjects"] != verified["subjects"]:
         differences["subjects"] = (
             omni["subjects"],
@@ -1288,84 +1333,12 @@ def validate_max_candidate_text(
     )
 
 
-def timecode(seconds: int) -> str:
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
-def render_segment_overview(
-    facts: dict[str, Any],
-    segment: dict[str, Any],
-) -> str:
-    labels = [
-        subject["label"]
-        for subject in facts["subjects"]
-        if subject["kind"] != "scene"
-    ]
-    subject_text = "、".join(labels) or "画面主体"
-    shots = segment["shots"]
-    if len(shots) == 1:
-        shot = shots[0]
-        return (
-            f"生成目标：在{shot['scene_light']}中，以{shot['shot_scale']}、"
-            f"{shot['camera']}呈现{subject_text}的连续动作与互动，"
-            "保持真实摄影质感。"
-        )
-    return (
-        f"生成目标：严格按下方时间轴呈现{subject_text}的连续动作、"
-        "场景和镜头变化，保持真实摄影质感。"
-    )
-
-
-def render_shot_static(shot: dict[str, Any]) -> str:
-    parts = [
-        f"{shot['shot_scale']}，{shot['camera']}",
-        shot["composition"],
-        f"画面可见范围：{shot['visible_body_range']}",
-        shot["entry_exit"],
-        shot["scene_light"],
-    ]
-    return "。".join(part.strip().rstrip("。") for part in parts if part.strip()) + "。"
-
-
 def render_prompt(
     facts: dict[str, Any],
     definitions: dict[str, str],
     audio_overrides: dict[tuple[int, int], str],
 ) -> str:
-    definition_block = "\n".join(definitions[subject["label"]] for subject in facts["subjects"])
-    multi = len(facts["segments"]) > 1
-    sections: list[str] = []
-    for segment in facts["segments"]:
-        lines: list[str] = []
-        if multi:
-            lines.append(
-                f"【第{segment['index']}段提示词（{segment['duration_seconds']}秒，"
-                f"对齐参考视频{segment['source_start_seconds']}-"
-                f"{segment['source_end_seconds']}秒）】"
-            )
-        lines.append(definition_block)
-        lines.append(render_segment_overview(facts, segment))
-        for shot in segment["shots"]:
-            lines.append(
-                f"镜头{shot['index']}[{timecode(shot['start_seconds'])}-"
-                f"{timecode(shot['end_seconds'])}]"
-            )
-            lines.append("画面：" + render_shot_static(shot))
-            for beat in shot["beats"]:
-                lines.append(
-                    f"动作阶段{beat['index']}[{timecode(beat['start_seconds'])}-"
-                    f"{timecode(beat['end_seconds'])}]："
-                    f"{str(beat['action']).rstrip('。')}。"
-                )
-            audio = audio_overrides.get(
-                (int(segment["index"]), int(shot["index"])),
-                str(shot["audio"]),
-            )
-            if audio:
-                lines.append("声音：" + audio.rstrip("。") + "。")
-        lines.append(QUALITY_CONSTRAINT)
-        sections.append("\n".join(lines))
-    return "\n\n".join(sections).strip()
+    return render_public_prompt(facts, definitions, audio_overrides)
 
 
 def default_definitions(facts: dict[str, Any]) -> dict[str, str]:
@@ -1398,6 +1371,7 @@ def build_omni_messages(
     maximum: int,
     has_audio: bool,
     transcript: str,
+    fps: float = 4.0,
 ) -> list[dict[str, Any]]:
     context = {
         "duration_seconds": duration_seconds,
@@ -1411,7 +1385,7 @@ def build_omni_messages(
         {
             "role": "user",
             "content": [
-                {"type": "video_url", "video_url": {"url": video_reference}},
+                {"type": "video_url", "video_url": {"url": video_reference}, "fps": fps},
                 {
                     "type": "text",
                     "text": "只输出结构化原片事实 JSON：\n"
@@ -1478,7 +1452,7 @@ def build_max_messages(
         ),
         "allowed_evidence_times": evidence_time_index(omni, source_duration),
         "correction_path_contract": CORRECTION_PATH_CONTRACT,
-        "timeline_contract": TIMELINE_CONTRACT,
+        "timeline_contract": (PUBLIC_TIMELINE_CONTRACT if omni["schema_version"] >= 3 else TIMELINE_CONTRACT),
         "available_image_count": number - 1,
         "product_name": args.product_name.strip(),
         "selling_points": args.selling_points.strip(),
@@ -1586,6 +1560,7 @@ def fact_lock(
 ) -> dict[str, Any]:
     body = {
         "schema_version": 2,
+        "prompt_format": FORMAT_VERSION,
         "status": "locked",
         "assembly_mode": "deterministic_from_max_verified_facts",
         "prompt_sha256": text_sha256(prompt),
@@ -1699,6 +1674,7 @@ def main() -> int:
                 args.segment_max_seconds,
                 bool(metadata["has_audio"]),
                 transcript,
+                fps=args.fps,
             )
             omni_payload = {
                 "model": args.omni_model,
@@ -1946,8 +1922,8 @@ def main() -> int:
                                 "相关视觉同步变化使用 segments[i].shot_visuals，"
                                 "shot_visuals 每项只含 correction_path_contract.value_fields，"
                                 "不得额外放入 index、起止时间或 audio；"
-                                "严格执行 timeline_contract，所有镜头与 beat 的起止时间必须是"
-                                " JSON 整数并连续完整覆盖，禁止任何小数秒；"
+                                "严格执行 timeline_contract 指定的时间精度，镜头与 beat "
+                                "必须连续完整覆盖；Schema v3 保留真实小数秒边界；"
                                 "不得使用单个 start_seconds 或 end_seconds 路径，也不得申报无实际差异的字段。"
                                 "只允许修正有时间证据的原片事实与静态外观绑定；"
                                 "原片音频事实或 no_speech_confirmed 变化必须作为"
@@ -2089,6 +2065,7 @@ def main() -> int:
             args.segment_max_seconds,
             expected_images,
             "确定性组装终稿",
+            facts=verified,
         )
         write_text_output(
             args.candidate_output,
