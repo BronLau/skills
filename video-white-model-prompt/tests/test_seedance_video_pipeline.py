@@ -352,6 +352,49 @@ class SeedancePipelineTests(unittest.TestCase):
                 },
             )
 
+    def test_prepare_skipped_portrait_confirmation_does_not_assert_rights(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, prompt, plan = self.write_single_segment_inputs(root)
+            prompt.write_text(
+                "参考@图片1中的人物，将其定义为<主播>。\n"
+                "镜头1[00:00-00:10] <主播>展示产品。\n",
+                encoding="utf-8",
+            )
+            character = root / "character.png"
+            Image.new("RGB", (720, 1280), "blue").save(character)
+            args = self.make_prepare_args(root, source, prompt, plan)
+            args.character_image = character
+            args.character_image_type = "virtual"
+            args.skip_portrait_confirmation = True
+
+            with mock.patch.object(MODULE, "probe_video", return_value=self.metadata()):
+                plan_path = MODULE.prepare(args)
+
+            body = json.loads(plan_path.read_text(encoding="utf-8"))
+            reference = MODULE.validate_character_reference_plan(body)
+            self.assertIsNotNone(reference)
+            self.assertFalse(reference["virtual_rights_confirmed"])
+            self.assertTrue(reference["confirmation_skipped"])
+            self.assertTrue(MODULE.plan_requires_storage(body, reference))
+
+    def test_skipping_portrait_confirmation_keeps_real_asset_requirement(self) -> None:
+        body = {
+            "schema_version": 4,
+            "images": [{"id": "image-01", "reference_role": "character"}],
+            "character_reference": {
+                "image_id": "image-01",
+                "portrait_type": "real",
+                "asset_id": None,
+                "virtual_rights_confirmed": False,
+                "confirmation_skipped": True,
+            },
+        }
+        with self.assertRaises(MODULE.SeedanceError):
+            MODULE.validate_character_reference_plan(body)
+
     def test_prepare_real_character_requires_authorized_asset_id(self) -> None:
         from PIL import Image
 

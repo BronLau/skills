@@ -140,7 +140,11 @@ def parse_args() -> argparse.Namespace:
         choices=("virtual", "real"),
     )
     prepare.add_argument("--character-asset-id")
-    prepare.add_argument("--confirm-virtual-portrait-rights", action="store_true")
+    portrait_confirmation = prepare.add_mutually_exclusive_group()
+    portrait_confirmation.add_argument(
+        "--confirm-virtual-portrait-rights", action="store_true"
+    )
+    portrait_confirmation.add_argument("--skip-portrait-confirmation", action="store_true")
     prepare.add_argument("--product-image", type=Path, action="append", default=[])
     prepare.add_argument("--effect-image", type=Path, action="append", default=[])
     prepare.add_argument("--effect-reference-scope", default="")
@@ -245,7 +249,10 @@ def validate_character_reference_plan(
     portrait_type = str(reference.get("portrait_type") or "")
     asset_id = normalize_asset_id(reference.get("asset_id"))
     if portrait_type == "virtual":
-        if not bool(reference.get("virtual_rights_confirmed")):
+        if (
+            not bool(reference.get("virtual_rights_confirmed"))
+            and reference.get("confirmation_skipped") is not True
+        ):
             raise SeedanceError("虚拟人像计划缺少素材权利确认。")
     elif portrait_type == "real":
         if not asset_id:
@@ -1027,7 +1034,11 @@ def prepare(args: argparse.Namespace) -> Path:
             raise SeedanceError(
                 "提供人物形象图时必须指定 --character-image-type virtual 或 real。"
             )
-        if character_image_type == "virtual" and not args.confirm_virtual_portrait_rights:
+        if (
+            character_image_type == "virtual"
+            and not args.confirm_virtual_portrait_rights
+            and not bool(getattr(args, "skip_portrait_confirmation", False))
+        ):
             raise SeedanceError(
                 "创建私域虚拟人像前必须明确确认素材权利与虚拟人像属性。"
             )
@@ -1035,7 +1046,12 @@ def prepare(args: argparse.Namespace) -> Path:
             raise SeedanceError(
                 "真人肖像不能上传至私域虚拟人像库；请提供已授权的 --character-asset-id。"
             )
-    elif character_image_type or character_asset_id or args.confirm_virtual_portrait_rights:
+    elif (
+        character_image_type
+        or character_asset_id
+        or args.confirm_virtual_portrait_rights
+        or bool(getattr(args, "skip_portrait_confirmation", False))
+    ):
         raise SeedanceError("人物人像参数必须与 --character-image 一起使用。")
     product_images = [
         require_file(path, f"第 {index} 张产品图")
@@ -1239,6 +1255,11 @@ def prepare(args: argparse.Namespace) -> Path:
                 "asset_id": character_asset_id or None,
                 "virtual_rights_confirmed": bool(
                     args.confirm_virtual_portrait_rights
+                ),
+                **(
+                    {"confirmation_skipped": True}
+                    if bool(getattr(args, "skip_portrait_confirmation", False))
+                    else {}
                 ),
             }
             if character_image

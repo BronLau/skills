@@ -78,7 +78,11 @@ def parse_args() -> argparse.Namespace:
         choices=("virtual", "real"),
     )
     parser.add_argument("--character-asset-id")
-    parser.add_argument("--confirm-virtual-portrait-rights", action="store_true")
+    portrait_confirmation = parser.add_mutually_exclusive_group()
+    portrait_confirmation.add_argument(
+        "--confirm-virtual-portrait-rights", action="store_true"
+    )
+    portrait_confirmation.add_argument("--skip-portrait-confirmation", action="store_true")
     parser.add_argument("--selling-points", default="")
     parser.add_argument("--user-idea", default="")
     parser.add_argument("--allow-audio-rewrite", action="store_true")
@@ -292,6 +296,8 @@ def run_manifest(
                 args.confirm_virtual_portrait_rights
             ),
         }
+        if bool(getattr(args, "skip_portrait_confirmation", False)):
+            body["character_reference"]["confirmation_skipped"] = True
     return body
 
 
@@ -548,6 +554,8 @@ def build_seedance_prepare_command(
             command.extend(["--character-asset-id", args.character_asset_id])
         if args.confirm_virtual_portrait_rights:
             command.append("--confirm-virtual-portrait-rights")
+        elif bool(getattr(args, "skip_portrait_confirmation", False)):
+            command.append("--skip-portrait-confirmation")
     for image in product_images:
         command.extend(["--product-image", str(image)])
     for image in effect_images:
@@ -646,6 +654,7 @@ def main() -> int:
             if (
                 args.character_image_type == "virtual"
                 and not args.confirm_virtual_portrait_rights
+                and not bool(getattr(args, "skip_portrait_confirmation", False))
             ):
                 raise PipelineError(
                     "创建私域虚拟人像前必须明确确认素材权利与虚拟人像属性。"
@@ -656,6 +665,7 @@ def main() -> int:
             args.character_image_type
             or args.character_asset_id
             or args.confirm_virtual_portrait_rights
+            or bool(getattr(args, "skip_portrait_confirmation", False))
         ):
             raise PipelineError("人物人像参数必须与 --character-image 一起使用。")
         transcript_file = (
@@ -684,6 +694,7 @@ def main() -> int:
             or args.character_image_type
             or args.character_asset_id
             or args.confirm_virtual_portrait_rights
+            or bool(getattr(args, "skip_portrait_confirmation", False))
             or args.selling_points.strip()
             or args.user_idea.strip()
             or args.allow_audio_rewrite
