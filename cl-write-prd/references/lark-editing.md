@@ -33,7 +33,7 @@
 
 ## 画板写入
 
-- 设计、原生节点转换和画板检查统一按 `diagram-design.md`；具体创建、更新与回读调用当前 `lark-whiteboard`。
+- 设计、原生节点转换和画板检查统一按 [diagram-design.md](diagram-design.md)；写入前按其“图层顺序与写入模式”组织提交数组，具体创建、更新与回读调用当前 `lark-whiteboard`。
 - 更新已有画板时复用原 token，遵守该 Skill 的更新方式与授权要求；不以新增整图图片代替原画板的编辑。
 
 ## HTML 原型附件
